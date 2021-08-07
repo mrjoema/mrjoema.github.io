@@ -46,7 +46,7 @@ additional_links:
 
 # About Section
 # about_title: About Me
-about_profile_image: images/profile.jpg
+about_profile_image: images/profile_pic.jpg
 about_content: | # this will include new lines to allow paragraphs
   Hi, my name is Joe and I'm a Software Development Engineer @ Amazon. Before joining Amazon, I was working as SDE in Microsoft and OfferUp.
 
