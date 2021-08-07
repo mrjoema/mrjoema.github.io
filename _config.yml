@@ -9,7 +9,7 @@ version: 2
 name: Joe Ma
 title: Software Development Engineer @ Amazon
 email: joema.dev@gmail.com
-website: www.github.com/sproogen/resume-theme
+# website: www.github.com/sproogen/resume-theme
 
 # Dark Mode (true/false/never)
 darkmode: true
@@ -57,14 +57,9 @@ content:
   - title: Job Contact
     layout: text
     content: | # this will include new lines to allow paragraphs
-        Native Android and iOS development
-        Stack: <mark>Android SDK</mark> <mark>React Native</mark> <mark>Flutter</mark>
-
-        Web development
-        Stack: <mark>React JS</mark> <mark>Webpack</mark> <mark>TypeScript</mark> <mark>JavaScript</mark>
-
-        Fullstack and Backend development
-        Stack: <mark>AWS</mark> <mark>NodeJS</mark> <mark>Java</mark>
+        - Native Android and iOS development
+        - Web development
+        - Fullstack and Backend development
 
   - title: Projects # Title for the section
     layout: list # Type of content section (list/text)
@@ -82,10 +77,16 @@ content:
           I implmented the config router that switches to different config based on the region that customer chose. It ensures the data are aggregated and sent to coresponding endpoint correctly. 
       
       - layout: top-middle
-        title: OfferUp Seller Ads (Android) - Allow customer to promote their items for sale by paying extra money
+        title: OfferUp Seller Ads (Android) - Allow customer to promote their items for sale
         link: https://help.offerup.com/hc/en-us/articles/360031994412-Promote-your-items
         description: | # this will include new lines to allow paragraphs
           I implmented the SDK that syncs with Google API and OfferUp for one time and subscription payments so users can pay for item promotion.
+      
+      - layout: top-middle
+        title: Predict the NYC traffic safety using Machine Learning
+        link: https://dl.acm.org/doi/10.1145/3093241.3093291
+        description: | # this will include new lines to allow paragraphs
+          I worked as an Undergraduate Research in ML field and implemented the model to predict NYC traffic safety using ML. The research paper was selected by International Conference on Compute and Data Analysis
 
   - title: Experience # Title for the section
     layout: list # Type of content section (list/text)
@@ -102,28 +103,28 @@ content:
       #       Every company needs its networks properly administered and The Boring Compay is no exception. Digging holes is hard and I play my part making sure the whole company stays connected. I lead a team of 5 people and enjoy driving the company to try new technologies.
 
     - layout: left
-      title: Amazon.com - Amazon Prime
+      title: Amazon.com
       link: amazon.com
       # link_text: boringcompany.com
-      sub_title: Software Development Engineer - Machine Learning
+      sub_title: Software Development Engineer
       caption: Aug 2020 - Present
       description: | # this will include new lines to allow paragraphs
         I work on ML infrastructure to develop the infrastructure that accelerate the productivity of scientist's ML model development in Amazon Prime
     
     - layout: left
-      title: Microsoft - PowerApps
+      title: Microsoft
       link: microsoft.com
       # link_text: boringcompany.com
-      sub_title: Software Development Engineer - Mobile and Web
+      sub_title: Software Development Engineer
       caption: Aug 2018 - Aug 2020
       description: | # this will include new lines to allow paragraphs
         I worked on Web team and mobile team in PowerApps that optimizes user experience in web and mobile app of PowerApps by developing new features and optimizing its performance
     
     - layout: left
       title: OfferUp
-      link: microsoft.com
+      link: offerup.com
       # link_text: boringcompany.com
-      sub_title: Software Development Engineer - Android
+      sub_title: Software Development Engineer
       caption: Jul 2017 - Jul 2018
       description: | # this will include new lines to allow paragraphs
         I worked on OfferUp Android team to develop features related to monetization such as ads, and item promotions.
@@ -147,18 +148,6 @@ content:
         sub_title: Major in Computer Science
         description: | # this will include new lines to allow paragraphs
           I studyed relative courses to accumulate credits for university transfering.
-
-  - title: A Little More About Me
-    layout: text
-    content: | # this will include new lines to allow paragraphs
-      Alongside my interests in networks and software engineering some of my other interests and hobbies are:
-      - Rock climbing
-      - Gaming
-      - Knitting
-      - [Becoming a ninja](https://www.youtube.com/watch?v=vtg4o__aRMg)
-
-      Look at this cool image  
-      ![Trees](/modern-resume-theme/images/landscape-trees.jpg "Trees")
 
 # Footer
 footer_show_references: true
