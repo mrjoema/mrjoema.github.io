@@ -1,0 +1,920 @@
+---
+title: '96% full-board accuracy on chess recognition — what the papers say and what actually worked'
+description: 'A results-first walkthrough of building a chess position recognizer: 99.85% per-square accuracy in 30 epochs, backed by five papers. Every design decision has a citation.'
+pubDate: '2026-05-27'
+type: 'article'
+tags: ['python', 'computer-vision', 'deep-learning', 'chess', 'pytorch']
+---
+
+Here are the numbers before anything else. Given a 1920×1080 rendered chessboard image, the system outputs a FEN string describing every piece position:
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700;width:50%">Metric</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Result</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="background:#f0fdf4;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Per-square accuracy (val)</td>
+      <td style="padding:9px 14px;font-weight:700;font-size:1.05em;color:#15803d">99.85%</td>
+    </tr>
+    <tr style="background:#f0fdf4;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Full-board accuracy (val)</td>
+      <td style="padding:9px 14px;font-weight:700;font-size:1.05em;color:#15803d">96%</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Inference latency (GPU FP16)</td>
+      <td style="padding:9px 14px;font-weight:700">~40 ms</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Inference latency (CPU)</td>
+      <td style="padding:9px 14px;font-weight:700">~500 ms</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Training epochs</td>
+      <td style="padding:9px 14px">30</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Dataset size</td>
+      <td style="padding:9px 14px">12,252 train / 3,072 test</td>
+    </tr>
+  </tbody>
+</table>
+
+96% full-board means roughly 96 out of 100 boards have all 64 squares predicted correctly — zero errors anywhere on the board. That number is hard to reach because one wrong square fails the whole board. The per-square number (99.85%) tells you the per-cell error rate is about 1.5 in 1,000.
+
+This post is a walkthrough of every design decision that got there, with the paper that justified each one.
+
+---
+
+## The problem: pixels in, FEN string out
+
+The task: given one top-down rendered PNG of a chessboard, predict the FEN piece-position string.
+
+**What is FEN?** FEN (Forsyth–Edwards Notation) is a compact way to describe where every piece sits on a chessboard. A string like `rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR` encodes all 64 squares — uppercase for white pieces, lowercase for black, digits for runs of empty squares. One FEN string = one complete board position.
+
+There are **13 possible classes per square**: empty, plus the 12 piece types (K Q R B N P in upper and lower case).
+
+**Why is full-board accuracy the right metric?** A model that is 99% per-square accurate but consistently wrong on one square per board scores 0% full-board. Every square must be correct for the board to be usable. Per-square accuracy is a training signal; full-board accuracy is the real-world score.
+
+### The full pipeline at a glance
+
+<svg viewBox="0 0 920 500" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f6feb"/>
+    </marker>
+  </defs>
+
+  {/* Row 1 */}
+  <rect x="40" y="20" width="200" height="80" rx="8" fill="#dceaff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="140" y="44" text-anchor="middle" font-size="13" font-weight="800" font-family="sans-serif">1. Input PNG</text>
+  <text x="140" y="62" text-anchor="middle" font-size="11" font-family="sans-serif">1920 × 1080 × 3</text>
+  <text x="140" y="78" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">H × W × RGB uint8</text>
+  <line x1="245" y1="60" x2="285" y2="60" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+
+  <rect x="290" y="20" width="200" height="80" rx="8" fill="#ece1ff" stroke="#6a3df5" stroke-width="2"/>
+  <text x="390" y="44" text-anchor="middle" font-size="13" font-weight="800" font-family="sans-serif">2. Warp (homography)</text>
+  <text x="390" y="62" text-anchor="middle" font-size="11" font-family="sans-serif">512 × 512 × 3</text>
+  <text x="390" y="78" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">1 square = 64×64 px</text>
+  <line x1="495" y1="60" x2="535" y2="60" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+
+  <rect x="540" y="20" width="200" height="80" rx="8" fill="#fff8d8" stroke="#b66f00" stroke-width="2"/>
+  <text x="640" y="44" text-anchor="middle" font-size="13" font-weight="800" font-family="sans-serif">3. Normalize</text>
+  <text x="640" y="62" text-anchor="middle" font-size="11" font-family="sans-serif">tensor (1, 3, 512, 512)</text>
+  <text x="640" y="78" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">÷255, ImageNet mean/std</text>
+
+  <line x1="640" y1="105" x2="640" y2="135" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+
+  {/* Row 2 */}
+  <rect x="540" y="140" width="200" height="80" rx="8" fill="#d8efde" stroke="#1c7c2e" stroke-width="2"/>
+  <text x="640" y="164" text-anchor="middle" font-size="13" font-weight="800" font-family="sans-serif">4. ResNet-50 backbone</text>
+  <text x="640" y="182" text-anchor="middle" font-size="11" font-family="sans-serif">features (1, 2048, 16, 16)</text>
+  <text x="640" y="198" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">extracts visual features</text>
+  <line x1="535" y1="180" x2="495" y2="180" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+
+  <rect x="290" y="140" width="200" height="80" rx="8" fill="#d8efde" stroke="#1c7c2e" stroke-width="2"/>
+  <text x="390" y="164" text-anchor="middle" font-size="13" font-weight="800" font-family="sans-serif">5. Head (pool + linear)</text>
+  <text x="390" y="182" text-anchor="middle" font-size="11" font-family="sans-serif">logits (1, 64, 13)</text>
+  <text x="390" y="198" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">13 class scores per square</text>
+  <line x1="285" y1="180" x2="245" y2="180" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+
+  <rect x="40" y="140" width="200" height="80" rx="8" fill="#ffe9cc" stroke="#a85a00" stroke-width="2"/>
+  <text x="140" y="164" text-anchor="middle" font-size="13" font-weight="800" font-family="sans-serif">6. Softmax</text>
+  <text x="140" y="182" text-anchor="middle" font-size="11" font-family="sans-serif">probs (1, 64, 13)</text>
+  <text x="140" y="198" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">scores → probabilities (sum=1)</text>
+  <line x1="140" y1="225" x2="140" y2="255" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+
+  {/* Row 3 */}
+  <rect x="40" y="260" width="200" height="80" rx="8" fill="#ffe9cc" stroke="#a85a00" stroke-width="2"/>
+  <text x="140" y="284" text-anchor="middle" font-size="13" font-weight="800" font-family="sans-serif">7. Argmax</text>
+  <text x="140" y="302" text-anchor="middle" font-size="11" font-family="sans-serif">classes (64,)</text>
+  <text x="140" y="318" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">pick highest-prob class per square</text>
+  <line x1="245" y1="300" x2="285" y2="300" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+
+  <rect x="290" y="260" width="200" height="80" rx="8" fill="#fdecec" stroke="#b21e1e" stroke-width="2"/>
+  <text x="390" y="284" text-anchor="middle" font-size="13" font-weight="800" font-family="sans-serif">8. Legality rules</text>
+  <text x="390" y="302" text-anchor="middle" font-size="11" font-family="sans-serif">classes (64,) fixed</text>
+  <text x="390" y="318" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">2 kings? pawn on back rank?</text>
+  <line x1="495" y1="300" x2="535" y2="300" stroke="#1f6feb" stroke-width="2" marker-end="url(#arr)"/>
+
+  <rect x="540" y="260" width="200" height="80" rx="8" fill="#dceaff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="640" y="284" text-anchor="middle" font-size="13" font-weight="800" font-family="sans-serif">9. FEN string</text>
+  <text x="640" y="302" text-anchor="middle" font-size="11" font-family="sans-serif">"rnbqkbnr/pppppppp/..."</text>
+  <text x="640" y="318" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">final output</text>
+
+  <text x="460" y="390" text-anchor="middle" font-size="13" fill="#666" font-family="sans-serif">Pixels (millions)  →  Features  →  Text (bytes)</text>
+  <text x="460" y="412" text-anchor="middle" font-size="12" fill="#888" font-family="sans-serif">~40 ms total on GPU FP16 / ~500 ms on CPU</text>
+  <rect x="30" y="425" width="860" height="50" rx="6" fill="#fff8d8" stroke="#b66f00"/>
+  <text x="460" y="447" text-anchor="middle" font-size="12" font-weight="700" fill="#a85a00" font-family="sans-serif">The actual model is only steps 4–5 (ResNet-50 + Head).</text>
+  <text x="460" y="465" text-anchor="middle" font-size="11" fill="#666" font-family="sans-serif">Everything else is pre/post-processing that runs outside the neural network.</text>
+</svg>
+
+---
+
+## What the papers said before writing a line of code
+
+My principle going in: every component must have a paper behind it, or I need my own ablation experiment to justify it. That kept me from chasing intuitions.
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Paper</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700;width:6%">Year</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Key result</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Role in this project</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/2511.11522">CVChess (Abeykoon et al.)</a></td>
+      <td style="padding:9px 14px">2025</td>
+      <td style="padding:9px 14px">98.93% per-square on real photos</td>
+      <td style="padding:9px 14px;font-weight:600">Architecture blueprint</td>
+    </tr>
+    <tr style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/1512.03385">ResNet (He et al.)</a></td>
+      <td style="padding:9px 14px">2015</td>
+      <td style="padding:9px 14px">Residual connections enable 50+ layer training</td>
+      <td style="padding:9px 14px;font-weight:600">Backbone</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/1409.0575">ImageNet (Russakovsky et al.)</a></td>
+      <td style="padding:9px 14px">2015</td>
+      <td style="padding:9px 14px">1.3M labeled images for pretraining</td>
+      <td style="padding:9px 14px;font-weight:600">Pretrained weights</td>
+    </tr>
+    <tr style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/2012.06858">LiveChess2FEN (Mallasén Quintana et al.)</a></td>
+      <td style="padding:9px 14px">2020</td>
+      <td style="padding:9px 14px">92% per-piece + legality Algorithm 2</td>
+      <td style="padding:9px 14px;font-weight:600">Post-processing rules</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/1708.03898">Neural Chessboard (Czyzewski et al.)</a></td>
+      <td style="padding:9px 14px">2017</td>
+      <td style="padding:9px 14px">~95% per-piece + chess rule enumeration</td>
+      <td style="padding:9px 14px;font-weight:600">Hard chess constraints</td>
+    </tr>
+    <tr style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/2103.07919">Chesscog (Wölflein &amp; Arandjelović)</a></td>
+      <td style="padding:9px 14px">2021</td>
+      <td style="padding:9px 14px">99.77% per-square on synthetic data</td>
+      <td style="padding:9px 14px;font-weight:600">Accuracy baseline</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/2310.04086">End-to-End (Masouris &amp; van Gemert)</a></td>
+      <td style="padding:9px 14px">2024</td>
+      <td style="padding:9px 14px;color:#dc2626">DETR "failed to converge"</td>
+      <td style="padding:9px 14px;font-weight:600">Negative result — ruled out Transformers</td>
+    </tr>
+  </tbody>
+</table>
+
+### Architecture blueprint — [CVChess (Abeykoon et al., 2025)](https://arxiv.org/abs/2511.11522)
+
+CVChess is the direct blueprint for the model architecture. The paper proposes a pipeline: ResNet-50 backbone → `AdaptiveAvgPool(8, 8)` → reshape to `(64, 2048)` → `Linear(2048 → 13)`. They report **98.93% per-square accuracy on real photographs** — a significantly harder domain than rendered images. If this architecture handles real photos at 98.9%, it should handle clean synthetic renders well above that.
+
+The key insight CVChess demonstrates is *per-square classification with a shared head*. One linear layer predicts all 64 squares simultaneously, sharing the same weights.
+
+**Why shared weights instead of 64 separate classifiers?** A white king looks the same whether it stands on e1 or d4. You want the same detector to fire wherever a white king appears, regardless of which square it occupies. Shared weights enforce that — the model learns "what a white king looks like" once, not 64 times. This uses 2,048 × 13 = 26,624 parameters instead of 64 times as many.
+
+I adopted CVChess's architecture verbatim, adding only ImageNet pretrained weights and horizontal flip augmentation.
+
+### Backbone — [ResNet (He et al., 2015)](https://arxiv.org/abs/1512.03385)
+
+**What is a residual network?** Before 2015, adding more layers to a neural network reliably made it train *worse*, not better. The problem is vanishing gradients: during backpropagation, the error signal multiplies through dozens of weight matrices on its way to the early layers, shrinking exponentially until the gradient is nearly zero. Early layers stop learning.
+
+ResNet's fix is a shortcut connection. Instead of `output = F(x)`, a residual block computes `output = F(x) + x`. The plain input is added back to the block's output. This gives gradients an express lane to early layers — instead of multiplying through every weight matrix, they can flow directly through the addition. He et al. showed that a 152-layer network could train reliably with this trick, and their CVPR 2016 Best Paper award reflects how transformative it was.
+
+<svg viewBox="0 0 800 260" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+  </defs>
+  <text x="400" y="22" text-anchor="middle" font-size="14" font-weight="800" font-family="sans-serif">Residual Block — the core of ResNet</text>
+
+  <rect x="40" y="100" width="80" height="50" fill="#dceaff" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="80" y="130" text-anchor="middle" font-size="12" font-family="sans-serif">input x</text>
+
+  <line x1="125" y1="125" x2="170" y2="125" stroke="#333" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+  <rect x="175" y="80" width="130" height="90" fill="#fff" stroke="#666" stroke-width="1.5"/>
+  <text x="240" y="110" text-anchor="middle" font-size="11" font-family="sans-serif">Conv 1×1</text>
+  <text x="240" y="128" text-anchor="middle" font-size="11" font-family="sans-serif">Conv 3×3</text>
+  <text x="240" y="146" text-anchor="middle" font-size="11" font-family="sans-serif">Conv 1×1</text>
+  <text x="240" y="162" text-anchor="middle" font-size="10" fill="#888" font-family="sans-serif">F(x)</text>
+
+  <line x1="310" y1="125" x2="355" y2="125" stroke="#333" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+  {/* shortcut */}
+  <path d="M 80 100 Q 80 45 240 45 Q 400 45 400 110" fill="none" stroke="#b21e1e" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+  <text x="240" y="36" text-anchor="middle" font-size="11" fill="#b21e1e" font-family="sans-serif">shortcut (skip connection) — x passes through unchanged</text>
+
+  <circle cx="400" cy="125" r="20" fill="#ffe9cc" stroke="#a85a00" stroke-width="1.5"/>
+  <text x="400" y="131" text-anchor="middle" font-size="18" font-weight="800" font-family="sans-serif">+</text>
+
+  <line x1="421" y1="125" x2="455" y2="125" stroke="#333" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+  <rect x="460" y="100" width="70" height="50" fill="#fff" stroke="#666" stroke-width="1.5"/>
+  <text x="495" y="130" text-anchor="middle" font-size="12" font-family="sans-serif">ReLU</text>
+
+  <line x1="535" y1="125" x2="565" y2="125" stroke="#333" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+  <rect x="570" y="100" width="185" height="50" fill="#d8efde" stroke="#1c7c2e" stroke-width="1.5"/>
+  <text x="663" y="130" text-anchor="middle" font-size="12" font-family="sans-serif">y = ReLU(F(x) + x)</text>
+
+  <text x="400" y="208" text-anchor="middle" font-size="12" fill="#555" font-family="sans-serif">The "+x" shortcut lets gradients flow directly to early layers.</text>
+  <text x="400" y="228" text-anchor="middle" font-size="12" fill="#555" font-family="sans-serif">Without it, a 50-layer network trains worse than a 20-layer one.</text>
+  <text x="400" y="248" text-anchor="middle" font-size="11" fill="#888" font-family="sans-serif">ResNet-50 has 16 residual blocks across 4 layer groups.</text>
+</svg>
+
+**Why pretrained on ImageNet?** [Russakovsky et al. (2015)](https://arxiv.org/abs/1409.0575) created ImageNet: 1.3 million labeled photographs across 1,000 categories. A ResNet-50 trained on ImageNet has already learned to detect edges, textures, gradients, and shapes from natural images. Fine-tuning from this starting point costs a fraction of training from scratch — the early layers already know how to look at images. We load these weights via `torchvision.models.ResNet50_Weights.IMAGENET1K_V2`.
+
+### Legality post-processing — [LiveChess2FEN (Mallasén Quintana et al., 2020)](https://arxiv.org/abs/2012.06858)
+
+LiveChess2FEN runs on a Jetson Nano for real-time physical board recognition, reporting **92% per-piece accuracy and 95% board detection**. Their contribution relevant here is a fixed-point legality post-processor (Algorithm 2) that applies hard chess rules after inference:
+
+- **R1**: each side has exactly one king — if the model predicts two, demote the lower-confidence one
+- **R2**: pawns cannot appear on the back rank (row 1 or row 8)
+- **R3**: piece count limits — each side has at most 8 pawns, 2 rooks, 2 bishops, 2 knights, 1 queen
+
+**Why post-process instead of adding these rules to the loss function?** Hard count constraints in a loss function create conflicting gradients. If the model predicts two white kings, the loss term that penalizes this fires on both squares simultaneously, pushing each square's prediction in opposite directions. Training becomes unstable. Post-processing with confidence-based demotion is cleaner: after inference, if two white kings appear, keep the square with higher softmax probability and replace the other with its second-most-likely class. The model's own confidence distribution makes the call.
+
+I implemented Algorithm 2 directly in `chess_recognition/legality.py`.
+
+### Hard chess rule set — [Czyzewski et al. (2017)](https://arxiv.org/abs/1708.03898)
+
+Czyzewski et al. report **~95% per-piece accuracy and 99.57% lattice point detection**. Their contribution relevant here is the enumeration of hard chess constraints, which I used to populate the R3 piece count rules above.
+
+### Why not a Transformer? — [Masouris & van Gemert (2024)](https://arxiv.org/abs/2310.04086)
+
+Masouris and van Gemert tried a DETR variant (a Transformer-based object detection architecture) for chess recognition and reported it **"failed to converge"**.
+
+**Why is this a valuable result?** DETR was designed to detect a variable number of objects at unknown locations. A chessboard is the opposite problem: exactly 64 predetermined locations, no need to find anything. The per-square CNN classification approach from CVChess is the right inductive bias for a fixed grid. DETR's flexibility is a liability when your output space is fully rigid. This negative result saved several days of investigation.
+
+### Synthetic images are tractable — [Chesscog (Wölflein & Arandjelović, 2021)](https://arxiv.org/abs/2103.07919)
+
+Chesscog achieves **99.77% per-square accuracy on synthetic data**, confirming that CNNs can classify rendered chess pieces to high accuracy. I did not use their board detection pipeline because in this dataset the camera is fixed — but their accuracy number set the expectation for what was achievable.
+
+---
+
+## The key insight from EDA: the camera does not move
+
+Before building the model, I averaged 200 training images pixel-by-pixel. If the camera moves between shots, the average blurs everywhere. If the camera is fixed, the static parts (the board surface) stay sharp while the moving parts (the pieces) blur out.
+
+The average image showed a crystal-clear board outline and completely blurred pieces. One observation, two architectural decisions:
+
+**1. Cached homography.** A homography is a 3×3 matrix that maps points on a tilted plane to a flat top-down view. `cv2.getPerspectiveTransform` computes the matrix from the four board corners, mapping the board to a 512×512 canonical view where each square occupies exactly 64×64 pixels. Because the camera never moves, compute this matrix once and reuse it for every image.
+
+<svg viewBox="0 0 780 270" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
+  <defs>
+    <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f6feb"/>
+    </marker>
+  </defs>
+  <text x="390" y="22" text-anchor="middle" font-size="14" font-weight="800" font-family="sans-serif">Homography: tilted board → canonical 512×512</text>
+
+  {/* Left: perspective view */}
+  <text x="160" y="50" text-anchor="middle" font-size="13" font-weight="700" font-family="sans-serif">Photo (perspective view)</text>
+  <rect x="30" y="60" width="260" height="185" fill="#f3f3f8" stroke="#888"/>
+  <polygon points="105,95 230,95 272,225 63,225" fill="#dceaff" stroke="#1f6feb" stroke-width="2"/>
+  <text x="170" y="168" text-anchor="middle" font-size="12" fill="#1f4fa8" font-family="sans-serif">board (trapezoid)</text>
+  <circle cx="105" cy="95" r="5" fill="#b21e1e"/>
+  <circle cx="230" cy="95" r="5" fill="#b21e1e"/>
+  <circle cx="272" cy="225" r="5" fill="#b21e1e"/>
+  <circle cx="63" cy="225" r="5" fill="#b21e1e"/>
+  <text x="98" y="89" font-size="10" fill="#b21e1e" font-family="sans-serif">a8</text>
+  <text x="235" y="89" font-size="10" fill="#b21e1e" font-family="sans-serif">h8</text>
+  <text x="277" y="240" font-size="10" fill="#b21e1e" font-family="sans-serif">h1</text>
+  <text x="42" y="240" font-size="10" fill="#b21e1e" font-family="sans-serif">a1</text>
+
+  {/* Arrow */}
+  <text x="390" y="148" text-anchor="middle" font-size="14" font-weight="800" fill="#1f6feb" font-family="sans-serif">H · x</text>
+  <text x="390" y="168" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">(3×3 matrix)</text>
+  <line x1="305" y1="158" x2="460" y2="158" stroke="#1f6feb" stroke-width="2.5" marker-end="url(#arr3)"/>
+
+  {/* Right: canonical view */}
+  <text x="610" y="50" text-anchor="middle" font-size="13" font-weight="700" font-family="sans-serif">Warped (512×512, top-down)</text>
+  <rect x="480" y="60" width="260" height="185" fill="#f3f3f8" stroke="#888"/>
+  <rect x="510" y="72" width="200" height="160" fill="#d8efde" stroke="#1c7c2e" stroke-width="2"/>
+  <text x="610" y="158" text-anchor="middle" font-size="12" fill="#1c7c2e" font-family="sans-serif">board (square)</text>
+  <circle cx="510" cy="72" r="5" fill="#b21e1e"/>
+  <circle cx="710" cy="72" r="5" fill="#b21e1e"/>
+  <circle cx="710" cy="232" r="5" fill="#b21e1e"/>
+  <circle cx="510" cy="232" r="5" fill="#b21e1e"/>
+  <text x="490" y="67" font-size="9" fill="#b21e1e" font-family="sans-serif">(0,0)</text>
+  <text x="690" y="67" font-size="9" fill="#b21e1e" font-family="sans-serif">(512,0)</text>
+  <text x="678" y="248" font-size="9" fill="#b21e1e" font-family="sans-serif">(512,512)</text>
+  <text x="490" y="248" font-size="9" fill="#b21e1e" font-family="sans-serif">(0,512)</text>
+  {/* 8x8 grid lines */}
+  <g stroke="#1c7c2e" stroke-width="0.5" opacity="0.5">
+    <line x1="535" y1="72" x2="535" y2="232"/>
+    <line x1="560" y1="72" x2="560" y2="232"/>
+    <line x1="585" y1="72" x2="585" y2="232"/>
+    <line x1="610" y1="72" x2="610" y2="232"/>
+    <line x1="635" y1="72" x2="635" y2="232"/>
+    <line x1="660" y1="72" x2="660" y2="232"/>
+    <line x1="685" y1="72" x2="685" y2="232"/>
+    <line x1="510" y1="92" x2="710" y2="92"/>
+    <line x1="510" y1="112" x2="710" y2="112"/>
+    <line x1="510" y1="132" x2="710" y2="132"/>
+    <line x1="510" y1="152" x2="710" y2="152"/>
+    <line x1="510" y1="172" x2="710" y2="172"/>
+    <line x1="510" y1="192" x2="710" y2="192"/>
+    <line x1="510" y1="212" x2="710" y2="212"/>
+  </g>
+</svg>
+
+Chesscog needed a full detection pipeline for board localization. This project skips it entirely — the cached homography does the job in microseconds.
+
+**2. Hash-based insurance.** Compute a SHA-256 hash of the top strip of the image (rows y=0..300, which shows only the background — no pieces). Same hash → camera in same position → use cached matrix. Different hash → camera moved → fall back to classical edge detection. Pieces occupy y=348 and below, so the hash is never influenced by piece positions.
+
+---
+
+## The piece misalignment problem (and why full-board classification solves it)
+
+Homography corrects the board *surface* — a flat 2D plane. Chess pieces are 3D objects. After warping, a tall piece like the king has its base (the ground truth label location) in square e4, but its crown can project into e5 or beyond.
+
+<svg viewBox="0 0 880 340" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
+  <defs>
+    <marker id="arr4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b21e1e"/>
+    </marker>
+  </defs>
+  <text x="440" y="22" text-anchor="middle" font-size="15" font-weight="800" font-family="sans-serif">The Piece Misalignment Problem</text>
+
+  {/* Left: side view */}
+  <text x="210" y="48" text-anchor="middle" font-size="13" font-weight="700" font-family="sans-serif">Side view (physical reality)</text>
+
+  <text x="55" y="90" font-size="11" font-family="sans-serif">📷 camera</text>
+  <line x1="75" y1="100" x2="380" y2="232" stroke="#888" stroke-dasharray="4,3"/>
+  <line x1="75" y1="100" x2="380" y2="282" stroke="#888" stroke-dasharray="4,3"/>
+
+  {/* board surface */}
+  <line x1="40" y1="282" x2="420" y2="282" stroke="#8b6914" stroke-width="3"/>
+  <text x="55" y="298" font-size="10" fill="#8b6914" font-family="sans-serif">board surface</text>
+
+  {/* pawn (short) */}
+  <ellipse cx="145" cy="280" rx="13" ry="3" fill="#555"/>
+  <rect x="139" y="258" width="12" height="22" fill="#555"/>
+  <ellipse cx="145" cy="255" rx="8" ry="5" fill="#555"/>
+  <text x="145" y="318" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">pawn (short)</text>
+
+  {/* king (tall) */}
+  <ellipse cx="275" cy="280" rx="15" ry="3" fill="#222"/>
+  <rect x="268" y="215" width="14" height="65" fill="#222"/>
+  <ellipse cx="275" cy="212" rx="12" ry="6" fill="#222"/>
+  <line x1="275" y1="206" x2="275" y2="192" stroke="#222" stroke-width="3"/>
+  <line x1="268" y1="198" x2="282" y2="198" stroke="#222" stroke-width="3"/>
+  <text x="275" y="318" text-anchor="middle" font-size="10" fill="#222" font-family="sans-serif">king (tall)</text>
+
+  {/* square boundaries */}
+  <g stroke="#1c7c2e" stroke-width="0.8">
+    <line x1="115" y1="282" x2="115" y2="290"/>
+    <line x1="175" y1="282" x2="175" y2="290"/>
+    <line x1="235" y1="282" x2="235" y2="290"/>
+    <line x1="295" y1="282" x2="295" y2="290"/>
+  </g>
+
+  {/* king crown projects */}
+  <line x1="275" y1="192" x2="175" y2="282" stroke="#b21e1e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr4)"/>
+  <text x="185" y="178" font-size="10" fill="#b21e1e" font-family="sans-serif">king's crown</text>
+  <text x="185" y="192" font-size="10" fill="#b21e1e" font-family="sans-serif">projects here ↓</text>
+  <circle cx="175" cy="282" r="5" fill="#b21e1e"/>
+  <text x="148" y="274" font-size="9" fill="#b21e1e" font-family="sans-serif">adjacent square!</text>
+
+  {/* Right: top-down after warp */}
+  <text x="660" y="48" text-anchor="middle" font-size="13" font-weight="700" font-family="sans-serif">After warp (top-down view)</text>
+
+  {/* 3×3 grid */}
+  <g stroke="#1c7c2e" stroke-width="1.5">
+    <rect x="500" y="70" width="75" height="75" fill="#f3f3f8"/>
+    <rect x="575" y="70" width="75" height="75" fill="#f3f3f8"/>
+    <rect x="650" y="70" width="75" height="75" fill="#fff8d8"/>
+    <rect x="725" y="70" width="75" height="75" fill="#f3f3f8"/>
+    <rect x="500" y="145" width="75" height="75" fill="#f3f3f8"/>
+    <rect x="575" y="145" width="75" height="75" fill="#f3f3f8"/>
+    <rect x="650" y="145" width="75" height="75" fill="#dceaff"/>
+    <rect x="725" y="145" width="75" height="75" fill="#f3f3f8"/>
+    <rect x="500" y="220" width="75" height="75" fill="#f3f3f8"/>
+    <rect x="575" y="220" width="75" height="75" fill="#f3f3f8"/>
+    <rect x="650" y="220" width="75" height="75" fill="#f3f3f8"/>
+    <rect x="725" y="220" width="75" height="75" fill="#f3f3f8"/>
+  </g>
+
+  {/* king base in center */}
+  <ellipse cx="688" cy="193" rx="14" ry="14" fill="#222"/>
+  <text x="688" y="198" text-anchor="middle" font-size="12" fill="#fff" font-weight="700" font-family="sans-serif">♔</text>
+  <text x="688" y="235" text-anchor="middle" font-size="10" fill="#1f4fa8" font-family="sans-serif">base (label here)</text>
+
+  {/* crown spills into square above */}
+  <ellipse cx="688" cy="105" rx="22" ry="18" fill="#222" opacity="0.65"/>
+  <text x="688" y="110" text-anchor="middle" font-size="13" fill="#fff" font-weight="700" font-family="sans-serif">♔ top</text>
+  <text x="688" y="65" text-anchor="middle" font-size="10" fill="#a85a00" font-family="sans-serif">crown "falls into" adjacent square!</text>
+
+  <line x1="688" y1="178" x2="688" y2="125" stroke="#b21e1e" stroke-width="2" stroke-dasharray="3,2" marker-end="url(#arr4)"/>
+</svg>
+
+**The naive approach fails.** Cropping 64 individual squares and running 64 separate classifiers makes this unsolvable: the most distinctive pixels for identifying the king in its square might be sitting in the adjacent square's crop.
+
+**The CVChess solution.** Classify all 64 squares from the full 512×512 image in one forward pass. ResNet-50 with a 32× stride has a receptive field of roughly 483×483 pixels at the deepest layers — nearly the full image. Each feature cell encodes context from a large patch of the board, not just one square.
+
+Analogy: imagine a panel of judges assessing 64 candidates simultaneously by watching them all work in the same room, rather than calling each one into a separate booth. The panel can see that the person labeled as sitting in seat 12 is actually reaching into seat 13 — because they have the full-room view. The per-booth interviewer would just see an empty seat.
+
+---
+
+## Architecture: from pixels to FEN
+
+The full inference pipeline with actual tensor shapes at each step:
+
+```
+Input:  PNG  →  1080 × 1920 × 3    (H × W × BGR uint8)
+         ↓
+BGR→RGB + cv2.warpPerspective
+         ↓
+Warped: 512 × 512 × 3              (1 square = 64×64 px)
+         ↓
+Normalize (/255, ImageNet mean/std)
+         ↓
+Tensor: 1 × 3 × 512 × 512          (B, C, H, W float32)
+         ↓
+ResNet-50 (Layer 4 output)
+         ↓
+Features: 1 × 2048 × 16 × 16       (NOT pixels — feature cells)
+         ↓
+AdaptiveAvgPool(8, 8)
+         ↓
+Pooled: 1 × 2048 × 8 × 8           (1 cell = 1 chess square)
+         ↓
+Reshape → 1 × 64 × 2048
+         ↓
+Linear(2048 → 13)
+         ↓
+Logits: 1 × 64 × 13                (13 scores per square)
+         ↓
+Softmax + argmax + legality rules
+         ↓
+FEN string: "rnbqkbnr/pppppppp/..."
+```
+
+### Understanding the three unit types
+
+The `16×16` after ResNet-50's layer 4 is not pixels. It is 16×16 *feature cells*, each holding 2048 channels of extracted features. One feature cell covers 32×32 pixels of the warped image. After pooling to 8×8, each cell covers 64×64 pixels — exactly one chess square.
+
+<svg viewBox="0 0 880 340" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
+  <defs>
+    <marker id="arr5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+  </defs>
+  <text x="440" y="22" text-anchor="middle" font-size="15" font-weight="800" font-family="sans-serif">Head: Feature Map → 64 square predictions</text>
+
+  {/* Feature map 16x16 */}
+  <text x="95" y="55" text-anchor="middle" font-size="12" font-weight="700" font-family="sans-serif">Feature Map</text>
+  <text x="95" y="70" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">(2048, 16, 16)</text>
+  <g transform="translate(35,85)">
+    <rect x="0" y="0" width="120" height="120" fill="#d8efde" stroke="#1c7c2e" stroke-width="0.5"/>
+    <g stroke="#1c7c2e" stroke-width="0.4" fill="none">
+      <line x1="7.5" y1="0" x2="7.5" y2="120"/><line x1="15" y1="0" x2="15" y2="120"/>
+      <line x1="22.5" y1="0" x2="22.5" y2="120"/><line x1="30" y1="0" x2="30" y2="120"/>
+      <line x1="37.5" y1="0" x2="37.5" y2="120"/><line x1="45" y1="0" x2="45" y2="120"/>
+      <line x1="52.5" y1="0" x2="52.5" y2="120"/><line x1="60" y1="0" x2="60" y2="120"/>
+      <line x1="67.5" y1="0" x2="67.5" y2="120"/><line x1="75" y1="0" x2="75" y2="120"/>
+      <line x1="82.5" y1="0" x2="82.5" y2="120"/><line x1="90" y1="0" x2="90" y2="120"/>
+      <line x1="97.5" y1="0" x2="97.5" y2="120"/><line x1="105" y1="0" x2="105" y2="120"/>
+      <line x1="112.5" y1="0" x2="112.5" y2="120"/>
+      <line x1="0" y1="7.5" x2="120" y2="7.5"/><line x1="0" y1="15" x2="120" y2="15"/>
+      <line x1="0" y1="22.5" x2="120" y2="22.5"/><line x1="0" y1="30" x2="120" y2="30"/>
+      <line x1="0" y1="37.5" x2="120" y2="37.5"/><line x1="0" y1="45" x2="120" y2="45"/>
+      <line x1="0" y1="52.5" x2="120" y2="52.5"/><line x1="0" y1="60" x2="120" y2="60"/>
+      <line x1="0" y1="67.5" x2="120" y2="67.5"/><line x1="0" y1="75" x2="120" y2="75"/>
+      <line x1="0" y1="82.5" x2="120" y2="82.5"/><line x1="0" y1="90" x2="120" y2="90"/>
+      <line x1="0" y1="97.5" x2="120" y2="97.5"/><line x1="0" y1="105" x2="120" y2="105"/>
+      <line x1="0" y1="112.5" x2="120" y2="112.5"/>
+    </g>
+    <text x="60" y="64" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">16 × 16</text>
+  </g>
+
+  <line x1="162" y1="145" x2="202" y2="145" stroke="#333" stroke-width="1.5" marker-end="url(#arr5)"/>
+  <text x="182" y="136" text-anchor="middle" font-size="9" fill="#6a3df5" font-family="sans-serif">AvgPool(8)</text>
+
+  {/* Pooled 8x8 */}
+  <text x="275" y="55" text-anchor="middle" font-size="12" font-weight="700" font-family="sans-serif">Pooled</text>
+  <text x="275" y="70" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">(2048, 8, 8)</text>
+  <g transform="translate(215,85)">
+    <rect x="0" y="0" width="120" height="120" fill="#dceaff" stroke="#1f6feb" stroke-width="0.5"/>
+    <g stroke="#1f6feb" stroke-width="0.7" fill="none">
+      <line x1="15" y1="0" x2="15" y2="120"/><line x1="30" y1="0" x2="30" y2="120"/>
+      <line x1="45" y1="0" x2="45" y2="120"/><line x1="60" y1="0" x2="60" y2="120"/>
+      <line x1="75" y1="0" x2="75" y2="120"/><line x1="90" y1="0" x2="90" y2="120"/>
+      <line x1="105" y1="0" x2="105" y2="120"/>
+      <line x1="0" y1="15" x2="120" y2="15"/><line x1="0" y1="30" x2="120" y2="30"/>
+      <line x1="0" y1="45" x2="120" y2="45"/><line x1="0" y1="60" x2="120" y2="60"/>
+      <line x1="0" y1="75" x2="120" y2="75"/><line x1="0" y1="90" x2="120" y2="90"/>
+      <line x1="0" y1="105" x2="120" y2="105"/>
+    </g>
+    <text x="60" y="64" text-anchor="middle" font-size="11" font-weight="700" fill="#1f4fa8" font-family="sans-serif">8 × 8</text>
+    <text x="60" y="80" text-anchor="middle" font-size="9" fill="#555" font-family="sans-serif">1 cell = 1 square</text>
+  </g>
+
+  <line x1="342" y1="145" x2="382" y2="145" stroke="#333" stroke-width="1.5" marker-end="url(#arr5)"/>
+  <text x="362" y="136" text-anchor="middle" font-size="9" fill="#6a3df5" font-family="sans-serif">reshape</text>
+
+  {/* 64 vectors */}
+  <text x="455" y="55" text-anchor="middle" font-size="12" font-weight="700" font-family="sans-serif">64 vectors</text>
+  <text x="455" y="70" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">(64, 2048)</text>
+  <g transform="translate(395,85)">
+    <rect x="0" y="0" width="120" height="120" fill="#ece1ff" stroke="#6a3df5"/>
+    <text x="60" y="45" text-anchor="middle" font-size="10" fill="#5e2bb8" font-family="sans-serif">a8 → vec₁</text>
+    <text x="60" y="62" text-anchor="middle" font-size="10" fill="#5e2bb8" font-family="sans-serif">b8 → vec₂</text>
+    <text x="60" y="79" text-anchor="middle" font-size="12" fill="#5e2bb8" font-family="sans-serif">⋮</text>
+    <text x="60" y="100" text-anchor="middle" font-size="10" fill="#5e2bb8" font-family="sans-serif">h1 → vec₆₄</text>
+  </g>
+
+  <line x1="522" y1="145" x2="562" y2="145" stroke="#333" stroke-width="1.5" marker-end="url(#arr5)"/>
+  <text x="542" y="136" text-anchor="middle" font-size="9" fill="#6a3df5" font-family="sans-serif">Linear(2048→13)</text>
+
+  {/* Logits */}
+  <text x="655" y="55" text-anchor="middle" font-size="12" font-weight="700" font-family="sans-serif">Logits</text>
+  <text x="655" y="70" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">(64, 13)</text>
+  <g transform="translate(580,85)">
+    <rect x="0" y="0" width="150" height="120" fill="#ffe9cc" stroke="#a85a00"/>
+    <text x="75" y="30" text-anchor="middle" font-size="10" fill="#a85a00" font-family="sans-serif">13 scores per square:</text>
+    <text x="75" y="50" text-anchor="middle" font-size="10" fill="#a85a00" font-family="sans-serif">[empty, K, Q, R, B,</text>
+    <text x="75" y="68" text-anchor="middle" font-size="10" fill="#a85a00" font-family="sans-serif">N, P, k, q, r, b, n, p]</text>
+    <text x="75" y="100" text-anchor="middle" font-size="10" fill="#666" font-family="sans-serif">e.g. [−2.1, 5.3, −1, …]</text>
+  </g>
+
+  <line x1="738" y1="145" x2="778" y2="145" stroke="#333" stroke-width="1.5" marker-end="url(#arr5)"/>
+  <text x="758" y="136" text-anchor="middle" font-size="9" fill="#6a3df5" font-family="sans-serif">softmax+argmax</text>
+
+  <g transform="translate(790,105)">
+    <rect x="0" y="0" width="75" height="80" fill="#fdecec" stroke="#b21e1e"/>
+    <text x="37" y="28" text-anchor="middle" font-size="11" font-weight="700" fill="#b21e1e" font-family="sans-serif">Class</text>
+    <text x="37" y="55" text-anchor="middle" font-size="22" font-weight="800" font-family="sans-serif">K</text>
+    <text x="37" y="72" text-anchor="middle" font-size="10" fill="#555" font-family="sans-serif">(white king)</text>
+  </g>
+
+  <rect x="35" y="235" width="830" height="52" fill="#fff8d8" stroke="#b66f00" rx="4"/>
+  <text x="450" y="257" text-anchor="middle" font-size="12" font-weight="700" fill="#a85a00" font-family="sans-serif">Key: the Linear layer uses the SAME weights for all 64 cells.</text>
+  <text x="450" y="277" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">2048 × 13 = 26,624 parameters classify all 64 squares. Spatial differences come entirely from the backbone's feature vectors.</text>
+</svg>
+
+The 2048 numbers per cell are not color values; they are learned representations of shapes, textures, and spatial relationships that ResNet extracted from that region.
+
+**Model parameters.** ~23M in the ResNet-50 backbone; 26,624 in the linear head (2048 × 13).
+
+---
+
+## Training: two-phase fine-tuning
+
+**Why two phases?** When you attach a randomly initialized head to a pretrained backbone, the head produces large, noisy gradients early in training — it has no idea what to do yet. If the backbone is unfrozen from the start, those noisy gradients corrupt the ImageNet features the backbone already learned before the head has stabilized.
+
+<svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
+  <defs>
+    <marker id="arr6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+  </defs>
+
+  {/* Training side */}
+  <rect x="20" y="20" width="420" height="320" fill="#f6f0ff" stroke="#6a3df5" stroke-width="2" rx="10"/>
+  <text x="230" y="50" text-anchor="middle" font-size="17" font-weight="800" fill="#5e2bb8" font-family="sans-serif">Training (done once)</text>
+  <text x="230" y="70" text-anchor="middle" font-size="12" fill="#5e2bb8" font-family="sans-serif">teaches the model — takes hours on GPU</text>
+
+  <rect x="50" y="88" width="360" height="50" fill="#fff" stroke="#6a3df5"/>
+  <text x="230" y="110" text-anchor="middle" font-size="13" font-weight="700" font-family="sans-serif">Input: 12,252 labeled images</text>
+  <text x="230" y="128" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">each PNG + corresponding FEN string</text>
+
+  <line x1="230" y1="142" x2="230" y2="162" stroke="#5e2bb8" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <rect x="50" y="165" width="360" height="60" fill="#ece1ff" stroke="#6a3df5"/>
+  <text x="230" y="187" text-anchor="middle" font-size="13" font-weight="700" font-family="sans-serif">Forward → Loss → Backward → Update</text>
+  <text x="230" y="205" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">repeat 30 epochs over all 12K images</text>
+  <text x="230" y="220" text-anchor="middle" font-size="10" fill="#666" font-family="sans-serif">code: chess_recognition/train.py</text>
+
+  <line x1="230" y1="230" x2="230" y2="250" stroke="#5e2bb8" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <rect x="50" y="253" width="360" height="60" fill="#d8efde" stroke="#1c7c2e"/>
+  <text x="230" y="275" text-anchor="middle" font-size="13" font-weight="700" font-family="sans-serif">Output: weights.pt (~90 MB)</text>
+  <text x="230" y="293" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">23M learned parameters</text>
+  <text x="230" y="308" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">this file IS "what the model knows"</text>
+
+  <text x="230" y="330" text-anchor="middle" font-size="11" fill="#5e2bb8" font-style="italic" font-family="sans-serif">Like a teacher correcting homework until the student learns</text>
+
+  {/* Inference side */}
+  <rect x="460" y="20" width="420" height="320" fill="#f0f6ff" stroke="#1f6feb" stroke-width="2" rx="10"/>
+  <text x="670" y="50" text-anchor="middle" font-size="17" font-weight="800" fill="#1f4fa8" font-family="sans-serif">Inference (per image)</text>
+  <text x="670" y="70" text-anchor="middle" font-size="12" fill="#1f4fa8" font-family="sans-serif">uses the model — ~40 ms on GPU</text>
+
+  <rect x="490" y="88" width="360" height="50" fill="#fff" stroke="#1f6feb"/>
+  <text x="670" y="110" text-anchor="middle" font-size="13" font-weight="700" font-family="sans-serif">Input: 1 unlabeled image</text>
+  <text x="670" y="128" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">no FEN — the model must predict it</text>
+
+  <line x1="670" y1="142" x2="670" y2="162" stroke="#1f4fa8" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <rect x="490" y="165" width="360" height="60" fill="#dceaff" stroke="#1f6feb"/>
+  <text x="670" y="187" text-anchor="middle" font-size="13" font-weight="700" font-family="sans-serif">Warp → Normalize → Forward</text>
+  <text x="670" y="205" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">no backward pass, no weight update</text>
+  <text x="670" y="220" text-anchor="middle" font-size="10" fill="#666" font-family="sans-serif">code: submission/predict.py</text>
+
+  <line x1="670" y1="230" x2="670" y2="250" stroke="#1f4fa8" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <rect x="490" y="253" width="360" height="60" fill="#d8efde" stroke="#1c7c2e"/>
+  <text x="670" y="275" text-anchor="middle" font-size="13" font-weight="700" font-family="sans-serif">Output: FEN string</text>
+  <text x="670" y="293" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">"rnbqkbnr/pppppppp/..."</text>
+  <text x="670" y="308" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">returned to caller</text>
+
+  <text x="670" y="330" text-anchor="middle" font-size="11" fill="#1f4fa8" font-style="italic" font-family="sans-serif">Like a student sitting an exam — applying what they learned</text>
+</svg>
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700;width:25%"></th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Phase 1 (epochs 1–3)</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Phase 2 (epochs 4–30)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Backbone</td>
+      <td style="padding:9px 14px;color:#d97706;font-weight:600">Frozen — 23M params unchanged</td>
+      <td style="padding:9px 14px;color:#16a34a;font-weight:600">Unfrozen — gently fine-tuned</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Head LR</td>
+      <td style="padding:9px 14px"><code>1e-3</code></td>
+      <td style="padding:9px 14px"><code>1e-3</code></td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Backbone LR</td>
+      <td style="padding:9px 14px;color:#94a3b8">N/A</td>
+      <td style="padding:9px 14px"><code>1e-4</code></td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">LR schedule</td>
+      <td style="padding:9px 14px">Constant</td>
+      <td style="padding:9px 14px">CosineAnnealingLR</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Purpose</td>
+      <td style="padding:9px 14px">Align head to existing ImageNet features</td>
+      <td style="padding:9px 14px">Adapt backbone features to chess textures</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Full-board acc. at end</td>
+      <td style="padding:9px 14px;color:#dc2626;font-weight:600">10.4%</td>
+      <td style="padding:9px 14px;color:#15803d;font-weight:700">96%</td>
+    </tr>
+  </tbody>
+</table>
+
+The effect of unfreezing is stark. At the end of epoch 3 (frozen), full-board accuracy was 10.4%. At the end of epoch 4 (first epoch unfrozen), it jumped to **62.9%** — a 52-point gain from a single epoch of backbone fine-tuning.
+
+**Loss function: weighted cross-entropy.** The dataset is imbalanced — roughly half of all squares are empty in any position. Without weighting, the model's easiest path is to predict "empty" everywhere and score ~50% per-square accuracy while producing useless FENs. Inverse-frequency class weights (capped at 5× to prevent rare pieces like queens from dominating training) fix this by making mistakes on occupied squares more costly.
+
+**Augmentation.** Horizontal flip with symmetric FEN label remapping (column a↔h, b↔g, etc. — a flipped board is still a valid board with mirrored piece positions), plus color jitter ±10% on brightness, contrast, and saturation.
+
+---
+
+## Legality post-processing in practice
+
+The neural network does not know chess rules. It has seen 12,252 boards during training and learned statistical patterns, but it is not guaranteed to output a legal board. In testing, the most common illegal predictions were:
+
+- Two kings of the same color (model was close to 50/50 on a low-contrast square)
+- A pawn on the back rank (class confusion between pawn and empty near the board edge)
+
+The [LiveChess2FEN](https://arxiv.org/abs/2012.06858) fixed-point algorithm resolves these with confidence-based demotion. When the model predicts two white kings, keep the square with the highest softmax probability as king, and replace the other with its second-most-likely class. Iterate until no rules are violated.
+
+In practice, this never ran more than 2 iterations on the validation set.
+
+---
+
+## Results
+
+Training results from `runs/v1/history.json`:
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700;width:20%">Epoch</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Per-square (val)</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Full-board (val)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px">1</td>
+      <td style="padding:9px 14px">89.3%</td>
+      <td style="padding:9px 14px">6.8%</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px">3</td>
+      <td style="padding:9px 14px">89.6%</td>
+      <td style="padding:9px 14px">10.4%</td>
+    </tr>
+    <tr style="background:#fef9c3;border-bottom:2px solid #ca8a04">
+      <td style="padding:9px 14px;font-weight:700">4 ✦ unfreeze</td>
+      <td style="padding:9px 14px;font-weight:700">96.0%</td>
+      <td style="padding:9px 14px;font-weight:700;color:#b45309">62.9% (+52 pts in 1 epoch)</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px">10</td>
+      <td style="padding:9px 14px">99.3%</td>
+      <td style="padding:9px 14px">83.0%</td>
+    </tr>
+    <tr style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px">17</td>
+      <td style="padding:9px 14px">99.6%</td>
+      <td style="padding:9px 14px">90.3%</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px">25</td>
+      <td style="padding:9px 14px">99.8%</td>
+      <td style="padding:9px 14px">95.0%</td>
+    </tr>
+    <tr style="background:#f0fdf4;border-bottom:2px solid #16a34a">
+      <td style="padding:9px 14px;font-weight:700">30 (final)</td>
+      <td style="padding:9px 14px;font-weight:700;color:#15803d">99.85%</td>
+      <td style="padding:9px 14px;font-weight:700;color:#15803d">96.0%</td>
+    </tr>
+  </tbody>
+</table>
+
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
+  <text x="410" y="22" text-anchor="middle" font-size="15" font-weight="800" font-family="sans-serif">Training curve: full-board accuracy by epoch</text>
+
+  {/* Axes */}
+  <line x1="60" y1="240" x2="780" y2="240" stroke="#333" stroke-width="1.5"/>
+  <line x1="60" y1="30" x2="60" y2="240" stroke="#333" stroke-width="1.5"/>
+
+  {/* Y axis labels */}
+  <text x="52" y="244" text-anchor="end" font-size="10" font-family="sans-serif" fill="#555">0%</text>
+  <text x="52" y="188" text-anchor="end" font-size="10" font-family="sans-serif" fill="#555">25%</text>
+  <text x="52" y="133" text-anchor="end" font-size="10" font-family="sans-serif" fill="#555">50%</text>
+  <text x="52" y="78" text-anchor="end" font-size="10" font-family="sans-serif" fill="#555">75%</text>
+  <text x="52" y="35" text-anchor="end" font-size="10" font-family="sans-serif" fill="#555">100%</text>
+  <line x1="58" y1="35" x2="780" y2="35" stroke="#eee" stroke-width="1"/>
+  <line x1="58" y1="78" x2="780" y2="78" stroke="#eee" stroke-width="1"/>
+  <line x1="58" y1="133" x2="780" y2="133" stroke="#eee" stroke-width="1"/>
+  <line x1="58" y1="188" x2="780" y2="188" stroke="#eee" stroke-width="1"/>
+
+  {/* X axis labels: epochs 1,3,4,10,17,25,30 mapped to x positions */}
+  {/* x = 60 + (epoch/30)*720 */}
+  {/* ep1→84, ep3→132, ep4→156, ep10→300, ep17→468, ep25→660, ep30→780 */}
+  <text x="84" y="258" text-anchor="middle" font-size="10" font-family="sans-serif" fill="#555">1</text>
+  <text x="132" y="258" text-anchor="middle" font-size="10" font-family="sans-serif" fill="#555">3</text>
+  <text x="156" y="258" text-anchor="middle" font-size="10" font-family="sans-serif" fill="#555">4</text>
+  <text x="300" y="258" text-anchor="middle" font-size="10" font-family="sans-serif" fill="#555">10</text>
+  <text x="468" y="258" text-anchor="middle" font-size="10" font-family="sans-serif" fill="#555">17</text>
+  <text x="660" y="258" text-anchor="middle" font-size="10" font-family="sans-serif" fill="#555">25</text>
+  <text x="780" y="258" text-anchor="middle" font-size="10" font-family="sans-serif" fill="#555">30</text>
+  <text x="420" y="274" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#555">Epoch</text>
+
+  {/* Frozen zone */}
+  <rect x="60" y="30" width="96" height="210" fill="#f6f0ff" opacity="0.6"/>
+  <text x="108" y="270" text-anchor="middle" font-size="9" fill="#6a3df5" font-family="sans-serif">frozen</text>
+
+  {/* Unfrozen zone */}
+  <rect x="156" y="30" width="624" height="210" fill="#f0fff4" opacity="0.5"/>
+  <text x="468" y="270" text-anchor="middle" font-size="9" fill="#1c7c2e" font-family="sans-serif">unfrozen backbone</text>
+
+  {/* freeze/unfreeze divider */}
+  <line x1="156" y1="30" x2="156" y2="248" stroke="#6a3df5" stroke-width="1.5" stroke-dasharray="4,3"/>
+
+  {/* Data points: full-board accuracy */}
+  {/* y = 240 - (acc/100)*210 */}
+  {/* ep1: 6.8% → y=226; ep3: 10.4% → y=218; ep4: 62.9% → y=108; ep10: 83% → y=66; ep17: 90.3% → y=51; ep25: 95% → y=41; ep30: 96% → y=38 */}
+  <polyline
+    points="84,226 132,218 156,218 156,108 300,66 468,51 660,41 780,38"
+    fill="none" stroke="#1f6feb" stroke-width="2.5"/>
+
+  <circle cx="84" cy="226" r="4" fill="#1f6feb"/>
+  <circle cx="132" cy="218" r="4" fill="#1f6feb"/>
+  <circle cx="156" cy="108" r="5" fill="#b21e1e"/>
+  <circle cx="300" cy="66" r="4" fill="#1f6feb"/>
+  <circle cx="468" cy="51" r="4" fill="#1f6feb"/>
+  <circle cx="660" cy="41" r="4" fill="#1f6feb"/>
+  <circle cx="780" cy="38" r="5" fill="#1c7c2e"/>
+
+  {/* Unfreeze annotation */}
+  <text x="170" y="102" font-size="10" fill="#b21e1e" font-weight="700" font-family="sans-serif">+52 pts</text>
+  <text x="170" y="114" font-size="9" fill="#b21e1e" font-family="sans-serif">in 1 epoch!</text>
+  <line x1="158" y1="110" x2="155" y2="110" stroke="#b21e1e" stroke-width="1.5"/>
+
+  {/* Final annotation */}
+  <text x="740" y="34" font-size="10" fill="#1c7c2e" font-weight="700" font-family="sans-serif">96%</text>
+</svg>
+
+**Why is full-board accuracy lower than per-square accuracy?** The math explains the gap. If each square has an independent 0.15% error rate, the probability that all 64 are correct is 0.9985^64 ≈ 0.907, or about 90.7%. The actual 96% is *better* than this naive independence model — errors are not uniformly distributed across all boards and squares. The model gets most boards perfectly right and clusters its mistakes on a subset of hard positions. If errors were random, we'd expect ~91%; the actual 96% means the model has learned to handle most positions reliably.
+
+**Comparison.** [Chesscog (Wölflein & Arandjelović, 2021)](https://arxiv.org/abs/2103.07919) reports 99.77% per-square on synthetic data with a more complex pipeline including separate board detection. This project reaches 99.85% with a simpler approach — no separate board detection, no per-square crop model, one unified forward pass.
+
+---
+
+## What did not work
+
+The [Masouris & van Gemert (2024)](https://arxiv.org/abs/2310.04086) DETR-based approach explicitly failed to converge, as documented in their paper. The structural reason: DETR is built to solve "how many objects are there, and where are they?" A chessboard has exactly 64 fixed locations — there is nothing to locate. The fixed-grid inductive bias of per-square CNN classification is simply the correct fit for this problem.
+
+---
+
+## Summary of design decisions and their sources
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700;width:25%">Decision</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Justification</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700;width:22%">Source</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">ResNet-50 backbone</td>
+      <td style="padding:9px 14px">Residual connections enable deep training; ImageNet pretraining provides strong features</td>
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/1512.03385">He et al. (2015)</a></td>
+    </tr>
+    <tr style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Per-square Linear head</td>
+      <td style="padding:9px 14px">Shared weights, fixed-grid output — 98.93% on real photos</td>
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/2511.11522">CVChess</a></td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">512×512 input</td>
+      <td style="padding:9px 14px">Divisibility by 32 (ResNet stride), alignment to 8×8 grid, memory budget</td>
+      <td style="padding:9px 14px">CVChess (adapted)</td>
+    </tr>
+    <tr style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">ImageNet pretrained weights</td>
+      <td style="padding:9px 14px">Match the backbone's expected input distribution</td>
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/1409.0575">Russakovsky et al. (2015)</a></td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Fixed-point legality rules</td>
+      <td style="padding:9px 14px">Stable post-processing without loss instability</td>
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/2012.06858">LiveChess2FEN</a></td>
+    </tr>
+    <tr style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Hard chess constraints (R1/R2/R3)</td>
+      <td style="padding:9px 14px">Enumerated rule set</td>
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/1708.03898">Czyzewski et al. (2017)</a></td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">No Transformer</td>
+      <td style="padding:9px 14px">DETR failed to converge on this task</td>
+      <td style="padding:9px 14px"><a href="https://arxiv.org/abs/2310.04086">Masouris &amp; van Gemert (2024)</a></td>
+    </tr>
+    <tr style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Cached homography</td>
+      <td style="padding:9px 14px">Camera fixed → compute once, reuse</td>
+      <td style="padding:9px 14px">EDA observation (this project)</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Two-phase fine-tuning</td>
+      <td style="padding:9px 14px">Prevent head's initial gradients from corrupting backbone</td>
+      <td style="padding:9px 14px">Standard practice, confirmed empirically</td>
+    </tr>
+    <tr style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Weighted cross-entropy</td>
+      <td style="padding:9px 14px">~50% empty squares cause class imbalance</td>
+      <td style="padding:9px 14px">Standard practice</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## References
+
+1. Abeykoon et al. (2025). *CVChess: A Robust Chess Recognition Pipeline*. [arXiv:2511.11522](https://arxiv.org/abs/2511.11522)
+2. He, K., Zhang, X., Ren, S., & Sun, J. (2015). *Deep Residual Learning for Image Recognition*. [arXiv:1512.03385](https://arxiv.org/abs/1512.03385). CVPR 2016 Best Paper.
+3. Mallasén Quintana et al. (2020). *LiveChess2FEN: a Framework for Classifying Chess Pieces based on CNNs*. [arXiv:2012.06858](https://arxiv.org/abs/2012.06858)
+4. Czyzewski et al. (2017). *Neural Chessboard*. [arXiv:1708.03898](https://arxiv.org/abs/1708.03898)
+5. Russakovsky et al. (2015). *ImageNet Large Scale Visual Recognition Challenge*. [arXiv:1409.0575](https://arxiv.org/abs/1409.0575)
+6. Wölflein, G. & Arandjelović, O. (2021). *Recognizing Chessboards and Their Pieces in the Wild*. [arXiv:2103.07919](https://arxiv.org/abs/2103.07919)
+7. Masouris, A. & van Gemert, J. (2024). *End-to-End Chess Recognition*. [arXiv:2310.04086](https://arxiv.org/abs/2310.04086)

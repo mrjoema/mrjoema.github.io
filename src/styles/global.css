@@ -17,7 +17,8 @@
 		0 16px 32px rgba(var(--gray), 33%);
 }
 body {
-	font-family: var(--font-atkinson);
+	font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', 'Helvetica Neue', Arial, sans-serif;
+	font-weight: 400;
 	margin: 0;
 	padding: 0;
 	text-align: left;
@@ -26,14 +27,14 @@ body {
 	word-wrap: break-word;
 	overflow-wrap: break-word;
 	color: rgb(var(--gray-dark));
-	font-size: 20px;
-	line-height: 1.7;
+	font-size: 17px;
+	line-height: 1.65;
 }
 main {
 	width: 720px;
 	max-width: calc(100% - 2em);
 	margin: auto;
-	padding: 3em 1em;
+	padding: 2em 0.5em;
 }
 h1,
 h2,
@@ -46,19 +47,19 @@ h6 {
 	line-height: 1.2;
 }
 h1 {
-	font-size: 3.052em;
+	font-size: 1.65em;
 }
 h2 {
-	font-size: 2.441em;
+	font-size: 1.3em;
 }
 h3 {
-	font-size: 1.953em;
+	font-size: 1.1em;
 }
 h4 {
-	font-size: 1.563em;
+	font-size: 1em;
 }
 h5 {
-	font-size: 1.25em;
+	font-size: 0.9em;
 }
 strong,
 b {
@@ -95,13 +96,22 @@ code {
 	padding: 2px 5px;
 	background-color: rgb(var(--gray-light));
 	border-radius: 2px;
+	font-size: 0.85em;
 }
 pre {
 	padding: 1.5em;
 	border-radius: 8px;
+	font-size: 0.85em;
+	overflow-x: auto;
 }
 pre > code {
 	all: unset;
+}
+svg {
+	display: block;
+	max-width: 100%;
+	height: auto;
+	overflow: visible;
 }
 blockquote {
 	border-left: 4px solid var(--accent);

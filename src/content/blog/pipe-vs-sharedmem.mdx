@@ -1,0 +1,887 @@
+---
+title: 'Pipe vs shared memory: what actually happens when you pass a tensor between processes'
+description: 'A benchmark-driven deep dive into OS primitives — virtual memory, kernel buffers, and why shared memory is 2.8× faster than pipe + pickle for passing tensors between Python processes.'
+pubDate: '2026-05-27'
+type: 'article'
+tags: ['python', 'performance', 'os', 'ray', 'multiprocessing']
+---
+
+I use Ray every day at work — submitting tasks, passing tensors between actors, watching the object store fill up. I have a rough mental model of what's happening, but "rough" has been bothering me. What actually moves when I call `ray.get()`? Why is it fast? What would happen if I had to build that myself?
+
+So I went back to basics. This post is about one specific question: when you pass a tensor between two Python processes, what actually happens at the OS level? I built a small benchmark — pickle over a pipe versus shared memory — and used it as an excuse to get concrete about virtual memory, kernel buffers, and why the difference matters.
+
+The goal isn't to reimplement Ray. It's to understand the OS primitives well enough that Ray's design stops feeling like magic — and starts feeling like a set of reasonable engineering decisions I can reason about.
+
+---
+
+## The setup
+
+The data is a synthetic sensor frame: a 1080p RGB image (shape `1920×1080×3`, ~6MB) and a LiDAR point cloud (65,536 points × 4 floats, ~1MB). Together about 7MB per frame — realistic for an autonomous vehicle simulation tick.
+
+I ran two experiments with the same data:
+
+- **Method A**: producer pickles the frame and sends it over `multiprocessing.Pipe`, consumer unpickles and wraps it in a torch tensor
+- **Method B**: producer writes into a `multiprocessing.shared_memory` block, passes only the name and shape metadata over a pipe, consumer attaches to the same block and reads directly
+
+Same data, same two processes, same machine. The only difference is how the bytes travel.
+
+The results (1080p RGB + LiDAR point cloud, ~7.3MB per frame):
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Method</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Throughput</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Avg latency</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">CPU time (10k frames)</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Effective bandwidth</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="background:#fff7ed;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Pipe + pickle</td>
+      <td style="padding:9px 14px">95 fps</td>
+      <td style="padding:9px 14px">0.84 ms</td>
+      <td style="padding:9px 14px">53.8 s</td>
+      <td style="padding:9px 14px">691 MB/s</td>
+    </tr>
+    <tr style="background:#f0fdf4;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Python shared memory</td>
+      <td style="padding:9px 14px"><strong>268 fps</strong></td>
+      <td style="padding:9px 14px"><strong>0.13 ms</strong></td>
+      <td style="padding:9px 14px"><strong>1.40 s</strong></td>
+      <td style="padding:9px 14px"><strong>1,947 MB/s</strong></td>
+    </tr>
+    <tr style="background:#f0fdf4;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Python ring buffer</td>
+      <td style="padding:9px 14px">263 fps</td>
+      <td style="padding:9px 14px">0.12 ms</td>
+      <td style="padding:9px 14px">1.30 s</td>
+      <td style="padding:9px 14px">1,910 MB/s</td>
+    </tr>
+    <tr style="background:#f0fdf4;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">C++ lock-free ring buffer</td>
+      <td style="padding:9px 14px">261 fps</td>
+      <td style="padding:9px 14px">0.11 ms</td>
+      <td style="padding:9px 14px">1.23 s</td>
+      <td style="padding:9px 14px">1,897 MB/s</td>
+    </tr>
+  </tbody>
+</table>
+
+The headline number: **2.8× more throughput, 6× lower latency, ~38× less CPU per frame** by eliminating pickle and the kernel copies. The C++ ring buffer's advantage over plain Python shared memory is surprisingly small — because the bottleneck is memory bandwidth (writing 7MB into the shared block), not the coordination mechanism.
+
+*(The numbers tell the story — but let's look at why.)*
+
+---
+
+## Method A: Pipe + Pickle
+
+Here's the producer side:
+
+```python
+def producer(conn: Connection, num_frames: int = 300) -> None:
+    for _ in range(num_frames):
+        rgb, cloud = make_frame()
+        payload = pickle.dumps((rgb, cloud), protocol=pickle.HIGHEST_PROTOCOL)
+        conn.send_bytes(payload)
+    conn.send_bytes(b"__done__")
+```
+
+And the consumer:
+
+```python
+def consumer(conn: Connection) -> list[float]:
+    while True:
+        raw_bytes = conn.recv_bytes()
+        if raw_bytes == b"__done__":
+            break
+        rgb, cloud = pickle.loads(raw_bytes)
+        tensor = torch.from_numpy(rgb.copy())
+```
+
+Looks simple. But here's what the OS is actually doing on every single frame — four distinct steps:
+
+<svg width="780" height="295" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0"   y="0" width="310" height="295" fill="#f0f4ff" rx="12"/>
+  <rect x="310" y="0" width="160" height="295" fill="#fff8f0" rx="0"/>
+  <rect x="470" y="0" width="310" height="295" fill="#f0f4ff" rx="12"/>
+  <text x="155" y="24" text-anchor="middle" font-size="11" font-weight="bold" fill="#3b4a6b">PRODUCER (user space)</text>
+  <text x="390" y="24" text-anchor="middle" font-size="11" font-weight="bold" fill="#92400e">KERNEL</text>
+  <text x="625" y="24" text-anchor="middle" font-size="11" font-weight="bold" fill="#3b4a6b">CONSUMER (user space)</text>
+  <line x1="310" y1="30" x2="310" y2="190" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="5,3"/>
+  <line x1="470" y1="30" x2="470" y2="190" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="5,3"/>
+  <defs>
+    <marker id="arr-r" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#dc2626"/></marker>
+    <marker id="arr-o" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#d97706"/></marker>
+  </defs>
+  <rect x="16" y="80" width="108" height="90" fill="white" stroke="#7c9fd4" stroke-width="1.5" rx="8"/>
+  <text x="70" y="104" text-anchor="middle" font-size="11" font-weight="bold" fill="#1e3a5f">numpy array</text>
+  <text x="70" y="120" text-anchor="middle" font-size="10" fill="#555">7.3 MB</text>
+  <text x="70" y="136" text-anchor="middle" font-size="10" fill="#888">producer heap</text>
+  <text x="70" y="158" text-anchor="middle" font-size="9" fill="#3b82f6">rgb + cloud</text>
+  <line x1="126" y1="125" x2="173" y2="125" stroke="#d97706" stroke-width="2" marker-end="url(#arr-o)"/>
+  <text x="150" y="66" text-anchor="middle" font-size="10" font-weight="bold" fill="#d97706">① pickle</text>
+  <text x="150" y="78" text-anchor="middle" font-size="10" font-weight="bold" fill="#d97706">.dumps()</text>
+  <text x="150" y="196" text-anchor="middle" font-size="9" fill="#888">CPU serialize</text>
+  <text x="150" y="208" text-anchor="middle" font-size="9" fill="#888">burns CPU cycles</text>
+  <rect x="175" y="80" width="108" height="90" fill="white" stroke="#d97706" stroke-width="1.5" rx="8"/>
+  <text x="229" y="104" text-anchor="middle" font-size="11" font-weight="bold" fill="#92400e">7.3MB bytes</text>
+  <text x="229" y="120" text-anchor="middle" font-size="10" fill="#555">serialized</text>
+  <text x="229" y="136" text-anchor="middle" font-size="10" fill="#888">producer heap</text>
+  <text x="229" y="158" text-anchor="middle" font-size="9" fill="#d97706">malloc'd copy</text>
+  <line x1="285" y1="125" x2="326" y2="125" stroke="#dc2626" stroke-width="2.5" marker-end="url(#arr-r)"/>
+  <text x="306" y="66" text-anchor="middle" font-size="10" font-weight="bold" fill="#dc2626">② write()</text>
+  <text x="306" y="78" text-anchor="middle" font-size="10" font-weight="bold" fill="#dc2626">COPY #1</text>
+  <text x="306" y="196" text-anchor="middle" font-size="9" fill="#888">syscall</text>
+  <text x="306" y="208" text-anchor="middle" font-size="9" fill="#888">context switch</text>
+  <rect x="328" y="70" width="124" height="110" fill="#fff3e0" stroke="#e8a44a" stroke-width="1.5" rx="8"/>
+  <text x="390" y="96" text-anchor="middle" font-size="11" font-weight="bold" fill="#92400e">pipe buffer</text>
+  <text x="390" y="112" text-anchor="middle" font-size="10" fill="#666">7.3MB in</text>
+  <text x="390" y="128" text-anchor="middle" font-size="10" fill="#666">kernel space</text>
+  <text x="390" y="148" text-anchor="middle" font-size="9" fill="#e67e22">2 context switches</text>
+  <text x="390" y="162" text-anchor="middle" font-size="9" fill="#e67e22">per frame</text>
+  <line x1="454" y1="125" x2="493" y2="125" stroke="#dc2626" stroke-width="2.5" marker-end="url(#arr-r)"/>
+  <text x="474" y="66" text-anchor="middle" font-size="10" font-weight="bold" fill="#dc2626">③ read()</text>
+  <text x="474" y="78" text-anchor="middle" font-size="10" font-weight="bold" fill="#dc2626">COPY #2</text>
+  <text x="474" y="196" text-anchor="middle" font-size="9" fill="#888">syscall</text>
+  <text x="474" y="208" text-anchor="middle" font-size="9" fill="#888">context switch</text>
+  <rect x="495" y="80" width="108" height="90" fill="white" stroke="#d97706" stroke-width="1.5" rx="8"/>
+  <text x="549" y="104" text-anchor="middle" font-size="11" font-weight="bold" fill="#92400e">7.3MB bytes</text>
+  <text x="549" y="120" text-anchor="middle" font-size="10" fill="#555">serialized</text>
+  <text x="549" y="136" text-anchor="middle" font-size="10" fill="#888">consumer heap</text>
+  <text x="549" y="158" text-anchor="middle" font-size="9" fill="#d97706">malloc'd copy</text>
+  <line x1="605" y1="125" x2="653" y2="125" stroke="#d97706" stroke-width="2" marker-end="url(#arr-o)"/>
+  <text x="630" y="66" text-anchor="middle" font-size="10" font-weight="bold" fill="#d97706">④ pickle</text>
+  <text x="630" y="78" text-anchor="middle" font-size="10" font-weight="bold" fill="#d97706">.loads()</text>
+  <text x="630" y="196" text-anchor="middle" font-size="9" fill="#888">CPU deserialize</text>
+  <text x="630" y="208" text-anchor="middle" font-size="9" fill="#888">burns CPU cycles</text>
+  <rect x="655" y="80" width="108" height="90" fill="white" stroke="#7c9fd4" stroke-width="1.5" rx="8"/>
+  <text x="709" y="104" text-anchor="middle" font-size="11" font-weight="bold" fill="#1e3a5f">numpy array</text>
+  <text x="709" y="120" text-anchor="middle" font-size="10" fill="#555">7.3 MB</text>
+  <text x="709" y="136" text-anchor="middle" font-size="10" fill="#888">consumer heap</text>
+  <text x="709" y="158" text-anchor="middle" font-size="9" fill="#3b82f6">ready to use</text>
+  <rect x="10" y="225" width="760" height="58" fill="#fef2f2" stroke="#fca5a5" stroke-width="1" rx="8"/>
+  <text x="390" y="245" text-anchor="middle" font-size="11" font-weight="bold" fill="#dc2626">Per frame: 2 kernel copies × 7.3MB + 2 CPU serialize/deserialize + 4 context switches</text>
+  <text x="390" y="263" text-anchor="middle" font-size="11" fill="#dc2626">Measured: 95 fps · 0.84ms avg latency · 691 MB/s · 53.8s CPU per 10,000 frames</text>
+</svg>
+
+There are actually **two separate problems** bundled together:
+
+1. **Serialization cost** — `pickle.dumps()` and `pickle.loads()` burn CPU converting Python objects to bytes and back
+2. **Two kernel copies** — the bytes cross the kernel boundary twice: once on `write()` into the pipe buffer, once on `read()` out
+
+Each `send_bytes` / `recv_bytes` is a syscall, which forces a context switch from user mode into kernel mode and back. At 60fps that's 120 context switches per second, before any real work is done.
+
+**Full picture — Method A annotated top to bottom:**
+
+```python
+from multiprocessing import Pipe, Process
+import pickle, torch, numpy as np
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+parent_conn, child_conn = Pipe()   # OS creates an anonymous pipe (two file descriptors)
+
+# fork(): child inherits child_conn fd; page table is copied (copy-on-write)
+p = Process(target=producer, args=(child_conn, NUM_FRAMES))
+p.start()
+
+# ── Producer (child process) ───────────────────────────────────────────────────
+def producer(conn, num_frames):
+    for _ in range(num_frames):
+        rgb, cloud = make_frame()                         # 7.3MB allocated on heap
+        payload = pickle.dumps((rgb, cloud), protocol=5) # CPU: walk object graph → malloc new buffer
+        conn.send_bytes(payload)                          # syscall write(): 7.3MB → kernel pipe buffer  ← COPY #1
+    conn.send_bytes(b"__done__")
+
+# ── Consumer (parent process) ──────────────────────────────────────────────────
+def consumer(conn):
+    while True:
+        raw = conn.recv_bytes()          # syscall read(): blocks until data arrives
+                                         # kernel copies 7.3MB → consumer heap              ← COPY #2
+        if raw == b"__done__":
+            break
+        rgb, cloud = pickle.loads(raw)   # CPU: deserialize bytes back to numpy arrays
+        tensor = torch.from_numpy(rgb.copy())
+
+# ── Teardown ───────────────────────────────────────────────────────────────────
+latencies = consumer(parent_conn)        # blocks here until producer sends __done__
+p.join()
+```
+
+The pipe is the only coordination mechanism: data and signal travel together, serialized inside the same bytes.
+
+---
+
+## Method B: Shared Memory
+
+The shared memory version allocates a block once at startup. The producer writes directly into it:
+
+```python
+class SharedFrame:
+    def write(self, rgb: np.ndarray, cloud: np.ndarray) -> None:
+        buf = self._shm.buf
+        ptr = np.frombuffer(buf, dtype=np.uint8, count=FRAME_BYTES)
+        ptr[:] = rgb.ravel()   # writes directly into shared memory
+```
+
+One subtlety worth noting: `ptr[:] = rgb.ravel()` is not the same as `ptr = rgb.ravel()`. The first writes into the shared buffer in-place. The second just rebinds the local variable — the shared buffer is never touched.
+
+The consumer attaches to the same block by name and reads from it:
+
+```python
+    def read(self) -> tuple[np.ndarray, np.ndarray]:
+        buf = self._shm.buf
+        rgb = np.frombuffer(buf, dtype=np.uint8, ...).reshape(FRAME_SHAPE).copy()
+```
+
+What the OS is doing this time:
+
+<svg width="780" height="280" xmlns="http://www.w3.org/2000/svg">
+  <rect width="780" height="280" fill="#fafafa" rx="12"/>
+  <text x="90"  y="24" text-anchor="middle" font-size="11" font-weight="bold" fill="#3b4a6b">PRODUCER (user space)</text>
+  <text x="390" y="24" text-anchor="middle" font-size="11" font-weight="bold" fill="#14532d">PHYSICAL RAM</text>
+  <text x="690" y="24" text-anchor="middle" font-size="11" font-weight="bold" fill="#3b4a6b">CONSUMER (user space)</text>
+  <defs>
+    <marker id="arr-g2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#16a34a"/></marker>
+    <marker id="arr-b2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2563eb"/></marker>
+    <marker id="arr-sl" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#94a3b8"/></marker>
+  </defs>
+  <rect x="15" y="48" width="150" height="115" fill="#e8f0fe" stroke="#7c9fd4" stroke-width="1.5" rx="8"/>
+  <text x="90" y="72"  text-anchor="middle" font-size="11" font-weight="bold" fill="#1e3a5f">numpy array</text>
+  <text x="90" y="88"  text-anchor="middle" font-size="10" fill="#555">7.3MB on heap</text>
+  <rect x="27" y="96" width="126" height="20" fill="#dbeafe" stroke="#93c5fd" stroke-width="1" rx="4"/>
+  <text x="90" y="110" text-anchor="middle" font-size="9" font-family="monospace" fill="#1d4ed8">vaddr: 0x7f1a0000</text>
+  <text x="90" y="133" text-anchor="middle" font-size="10" fill="#555">ptr[:] = rgb.ravel()</text>
+  <text x="90" y="150" text-anchor="middle" font-size="9" fill="#16a34a">writes into shm</text>
+  <line x1="167" y1="108" x2="292" y2="108" stroke="#16a34a" stroke-width="2" marker-end="url(#arr-g2)"/>
+  <text x="230" y="70"  text-anchor="middle" font-size="10" font-weight="bold" fill="#16a34a">① write into shm</text>
+  <text x="230" y="82"  text-anchor="middle" font-size="10" fill="#16a34a">1 copy · no serialize</text>
+  <text x="230" y="126" text-anchor="middle" font-size="9" fill="#888">direct memory write</text>
+  <text x="230" y="138" text-anchor="middle" font-size="9" fill="#888">no syscall needed</text>
+  <rect x="295" y="38" width="190" height="145" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5" rx="8"/>
+  <text x="390" y="62"  text-anchor="middle" font-size="11" font-weight="bold" fill="#14532d">Physical RAM</text>
+  <text x="390" y="78"  text-anchor="middle" font-size="10" fill="#166534">7.3MB shared block</text>
+  <rect x="308" y="85" width="166" height="20" fill="#bbf7d0" stroke="#86efac" stroke-width="1" rx="3"/>
+  <text x="391" y="99"  text-anchor="middle" font-size="9" font-family="monospace" fill="#14532d">phys: 0xABCD0000</text>
+  <text x="390" y="120" text-anchor="middle" font-size="9" fill="#15803d">one allocation · never moves</text>
+  <text x="390" y="135" text-anchor="middle" font-size="9" fill="#15803d">~1,518 × 4KB pages</text>
+  <text x="390" y="150" text-anchor="middle" font-size="9" fill="#d97706">⚡ page fault on first write only</text>
+  <text x="390" y="165" text-anchor="middle" font-size="9" fill="#15803d">warm after first frame</text>
+  <line x1="487" y1="108" x2="612" y2="108" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-b2)"/>
+  <text x="550" y="70"  text-anchor="middle" font-size="10" font-weight="bold" fill="#2563eb">② mmap view</text>
+  <text x="550" y="82"  text-anchor="middle" font-size="10" fill="#2563eb">0 copies · 0 serialize</text>
+  <text x="550" y="126" text-anchor="middle" font-size="9" fill="#888">OS page table maps</text>
+  <text x="550" y="138" text-anchor="middle" font-size="9" fill="#888">same physical pages</text>
+  <rect x="615" y="48" width="150" height="115" fill="#e8f0fe" stroke="#7c9fd4" stroke-width="1.5" rx="8"/>
+  <text x="690" y="72"  text-anchor="middle" font-size="11" font-weight="bold" fill="#1e3a5f">numpy view</text>
+  <text x="690" y="88"  text-anchor="middle" font-size="10" fill="#555">zero-copy read</text>
+  <rect x="627" y="96" width="126" height="20" fill="#dbeafe" stroke="#93c5fd" stroke-width="1" rx="4"/>
+  <text x="690" y="110" text-anchor="middle" font-size="9" font-family="monospace" fill="#1d4ed8">vaddr: 0x7f2b0000</text>
+  <text x="690" y="133" text-anchor="middle" font-size="10" fill="#555">np.frombuffer(shm.buf)</text>
+  <text x="690" y="150" text-anchor="middle" font-size="9" fill="#2563eb">no new allocation</text>
+  <line x1="90" y1="190" x2="612" y2="190" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#arr-sl)"/>
+  <rect x="220" y="178" width="340" height="20" fill="white" stroke="#e2e8f0" stroke-width="1" rx="4"/>
+  <text x="390" y="192" text-anchor="middle" font-size="10" fill="#64748b">Pipe carries only: "zcm_frame_slot" (~20 bytes, not 7.3MB)</text>
+  <rect x="10" y="215" width="760" height="54" fill="#f0fdf4" stroke="#86efac" stroke-width="1" rx="8"/>
+  <text x="390" y="235" text-anchor="middle" font-size="11" font-weight="bold" fill="#16a34a">Per frame: 1 write (heap→shm) · 0 kernel copies · 0 serialize ops · 0 context switches</text>
+  <text x="390" y="253" text-anchor="middle" font-size="11" fill="#16a34a">Measured: 268 fps · 0.13ms avg latency · 1,947 MB/s · 1.4s CPU per 10,000 frames</text>
+</svg>
+
+The bytes never move. The pipe only carries a short name string — something like `"zcm_frame_slot"`. Both processes map that name to the same physical pages via their own virtual address spaces. Producer's virtual address A and consumer's virtual address B are different numbers, but they point to the same physical RAM.
+
+Under the hood, `multiprocessing.SharedMemory` is wrapping three POSIX calls:
+
+```python
+# What Python does for you:
+shm_open("zcm_frame_slot", O_CREAT | O_RDWR, 0600)  # create named shm
+ftruncate(fd, size)                                   # set size
+mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)  # map into VA space
+```
+
+**One wrinkle: page faults on first access.** The first time the producer writes into the shared block, the OS hasn't yet allocated physical pages for it — those pages only get faulted in as you touch them. A 1080p RGB frame spans ~1,518 4KB pages, so the first write triggers ~1,518 page faults. Subsequent writes are fast — the OS mapping is already in place. Production pipelines pre-warm the buffer at startup to absorb this cost before real frames arrive.
+
+**Full picture — Method B annotated top to bottom:**
+
+```python
+from multiprocessing import Pipe, Process
+from multiprocessing.shared_memory import SharedMemory
+import numpy as np, torch
+
+FRAME_BYTES = 1920 * 1080 * 3   # 6.2MB RGB
+CLOUD_BYTES = 65536 * 4 * 4     # 1.0MB point cloud
+TOTAL_BYTES = FRAME_BYTES + CLOUD_BYTES
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+# shm_open() + ftruncate() + mmap(): OS allocates physical pages, maps into VA space
+shm = SharedMemory(name="zcm_frame_slot", create=True, size=TOTAL_BYTES)
+
+parent_conn, child_conn = Pipe()   # pipe carries only signals now, not frame data
+
+p = Process(target=producer_shm, args=(child_conn, NUM_FRAMES))
+p.start()
+
+# ── Producer (child process) ───────────────────────────────────────────────────
+def producer_shm(conn, num_frames):
+    # second mmap to the same backing file → same physical pages, different virtual address
+    local_shm = SharedMemory(name="zcm_frame_slot", create=False, size=TOTAL_BYTES)
+    buf = np.frombuffer(local_shm.buf, dtype=np.uint8)
+
+    for _ in range(num_frames):
+        rgb, cloud = make_frame()
+        buf[:FRAME_BYTES] = rgb.ravel()   # user-space write into shared pages — no kernel crossing
+        conn.send("ready")                # syscall: ~5 bytes over pipe, NOT the 7.3MB frame  ← signal only
+
+    conn.send(None)
+    local_shm.close()
+
+# ── Consumer (parent process) ──────────────────────────────────────────────────
+def consumer_shm(shm, conn):
+    # same physical pages, consumer's own virtual address
+    buf = np.frombuffer(shm.buf, dtype=np.uint8)
+
+    while True:
+        msg = conn.recv()              # blocks on the 5-byte signal, not the frame data
+        if msg is None:
+            break
+        # zero-copy read: buf already points at shared pages, no kernel crossing
+        rgb = buf[:FRAME_BYTES].reshape(1080, 1920, 3).copy()
+        tensor = torch.from_numpy(rgb)
+
+# ── Teardown ───────────────────────────────────────────────────────────────────
+latencies = consumer_shm(shm, parent_conn)
+p.join()
+
+shm.close()    # munmap: remove this process's virtual mapping
+shm.unlink()   # unlink: delete /dev/shm/zcm_frame_slot (backing file)
+```
+
+Pipe carries only the signal (`"ready"` or `None`). The 7.3MB frame never touches the kernel.
+
+---
+
+## The signaling problem — and a hidden race condition
+
+Shared memory eliminates copies, but creates two new questions:
+
+1. How does the consumer know the data is ready?
+2. How does the producer know the consumer has finished reading before it overwrites?
+
+The single-slot code above only solves question 1. It ignores question 2 entirely — and that's a real bug.
+
+The OS pipe buffers messages in a FIFO queue (~64KB on Linux). The producer never blocks on `conn.send("ready")` unless that buffer is full. So with a fast producer:
+
+```
+producer: write frame 1 → shm,  send "ready"        # pipe: [ready]
+producer: write frame 2 → shm,  send "ready"         # OVERWRITES frame 1  pipe: [ready, ready]
+consumer: recv() → "ready", reads shm → gets frame 2  # frame 1 is gone
+producer: write frame 3 → shm,  send "ready"         # overwrites again...
+```
+
+One shared slot, multiple buffered signals — every read is racing against the next write.
+
+The naive fix is an explicit ACK — consumer tells producer "I'm done, you can write now":
+
+```python
+# producer
+buf[:FRAME_BYTES] = rgb.ravel()
+conn.send("ready")
+conn.recv()            # ← wait for consumer to finish before overwriting
+
+# consumer
+conn.recv()            # wait for signal
+rgb = buf[:FRAME_BYTES].reshape(...).copy()
+conn.send("ack")       # ← release producer to write next frame
+```
+
+Now producer and consumer strictly take turns. No overwrites, no corrupted reads. But throughput is cut nearly in half — the producer sits idle while the consumer processes, and the consumer sits idle while the producer writes. No pipelining.
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Signaling approach</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Race condition?</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Throughput</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Coordination cost</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="background:#fef2f2;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Single slot + pipe signal</td>
+      <td style="padding:9px 14px;color:#dc2626;font-weight:700">Yes — producer overwrites before consumer reads</td>
+      <td style="padding:9px 14px">Full</td>
+      <td style="padding:9px 14px">None, but data is silently lost</td>
+    </tr>
+    <tr style="background:#fff7ed;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Single slot + explicit ACK</td>
+      <td style="padding:9px 14px;color:#16a34a;font-weight:700">No</td>
+      <td style="padding:9px 14px"><strong>~Half</strong> — producer and consumer take strict turns</td>
+      <td style="padding:9px 14px">2 round-trip syscalls per frame</td>
+    </tr>
+    <tr style="background:#f0fdf4;border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Ring buffer (N slots)</td>
+      <td style="padding:9px 14px;color:#16a34a;font-weight:700">No</td>
+      <td style="padding:9px 14px"><strong>Full</strong> — producer and consumer run concurrently</td>
+      <td style="padding:9px 14px">Lock/atomic on each slot state transition</td>
+    </tr>
+  </tbody>
+</table>
+
+The ring buffer solves both problems at once. Instead of a single slot, it uses N slots — each with its own state variable embedded in the shared memory itself. Each slot cycles through four states:
+
+```
+EMPTY → WRITING → READY → READING → EMPTY
+```
+
+Here is the complete Python implementation (mutex-based, easier to follow):
+
+```python
+EMPTY, WRITING, READY, READING = 0, 1, 2, 3
+
+class PyRingBuffer:
+    def __init__(self, name: str, num_slots: int, slot_bytes: int):
+        self._num_slots  = num_slots
+        self._slot_bytes = slot_bytes
+        self._shm        = SharedMemory(name=name, create=True,
+                                        size=num_slots * slot_bytes)
+        self._states     = Array('i', [EMPTY] * num_slots)  # shared, has built-in lock
+        self._write_head = Value('I', 0)
+        self._read_head  = Value('I', 0)
+
+    # ── Producer ──────────────────────────────────────────────────
+
+    def acquire_write(self) -> tuple[int, memoryview]:
+        while True:
+            idx = self._write_head.value % self._num_slots
+            with self._states.get_lock():
+                if self._states[idx] == EMPTY:
+                    self._states[idx] = WRITING
+                    self._write_head.value += 1
+                    offset = idx * self._slot_bytes
+                    return idx, self._shm.buf[offset: offset + self._slot_bytes]
+            time.sleep(0)  # yield CPU, wait for consumer to free a slot
+
+    def commit_write(self, slot_idx: int) -> None:
+        with self._states.get_lock():
+            self._states[slot_idx] = READY
+
+    # ── Consumer ──────────────────────────────────────────────────
+
+    def acquire_read(self) -> tuple[int, memoryview]:
+        while True:
+            idx = self._read_head.value % self._num_slots
+            with self._states.get_lock():
+                if self._states[idx] == READY:
+                    self._states[idx] = READING
+                    self._read_head.value += 1
+                    offset = idx * self._slot_bytes
+                    return idx, self._shm.buf[offset: offset + self._slot_bytes]
+            time.sleep(0)
+
+    def release_read(self, slot_idx: int) -> None:
+        with self._states.get_lock():
+            self._states[slot_idx] = EMPTY
+```
+
+Here is how the producer and consumer are wired together:
+
+```python
+# main process — create ring buffer, spawn producer, run consumer
+SLOT_BYTES = FRAME_BYTES + CLOUD_BYTES                        # 7.3MB per slot
+rb = PyRingBuffer("zcm_ring", num_slots=8, slot_bytes=SLOT_BYTES)
+parent_conn, child_conn = Pipe()
+
+producer_proc = Process(target=producer, args=(rb, child_conn, NUM_FRAMES))
+producer_proc.start()
+latencies = consumer(rb, parent_conn)
+producer_proc.join()
+rb.close()
+rb.unlink()
+
+# producer process
+def producer(rb, conn, num_frames):
+    for _ in range(num_frames):
+        rgb, cloud = make_frame()
+        slot_idx, mv = rb.acquire_write()
+        np.copyto(np.frombuffer(mv[:FRAME_BYTES], dtype=np.uint8), rgb.ravel())
+        np.copyto(np.frombuffer(mv[FRAME_BYTES:], dtype=np.float32), cloud.ravel())
+        rb.commit_write(slot_idx)
+        conn.send(slot_idx)         # signal: "slot N is ready"
+    conn.send(None)
+
+# consumer process
+def consumer(rb, conn):
+    while True:
+        msg = conn.recv()           # wait for signal
+        if msg is None:
+            break
+        slot_idx, mv = rb.acquire_read()
+        rgb = np.frombuffer(mv[:FRAME_BYTES], dtype=np.uint8).reshape(FRAME_SHAPE)
+        tensor = torch.from_numpy(rgb.copy())
+        rb.release_read(slot_idx)
+```
+
+Notice the pipe is still there — but it now carries a 4-byte slot index, not 7.3MB. The data never touches the kernel. The producer calls `acquire_write()` to claim a slot, writes directly into the returned `memoryview`, calls `commit_write()` to mark it `READY`, then sends the index as a nudge. The consumer waits for the nudge, calls `acquire_read()` to get the slot view, reads it zero-copy, and calls `release_read()` to free the slot.
+
+---
+
+## What Ray actually does
+
+Once you understand Method B, Ray's Plasma object store is immediately recognisable. The OS mechanism is identical — Ray just productionises the parts I left manual.
+
+> **Scope:** everything below describes workers on the **same node** as the Plasma store, for **large objects (> 100KB)**. Objects smaller than 100KB are stored directly on the owner worker's heap (the "in-process store") and copied by value to any reader — no shared memory involved. For the 7.3MB frames in this post, Plasma always applies. Workers on a different node trigger a network transfer first — the local raylet fetches the object from the remote raylet over gRPC, depositing a copy into the receiving node's Plasma store. Once that copy exists locally, the same mmap path applies.
+
+<svg width="700" height="310" xmlns="http://www.w3.org/2000/svg">
+  <rect width="700" height="310" fill="#fafafa" rx="12"/>
+  <text x="175" y="30" text-anchor="middle" font-size="12" font-weight="bold" fill="#3b4a6b">My experiment</text>
+  <text x="525" y="30" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e40af">Ray</text>
+  <line x1="10" y1="38" x2="340" y2="38" stroke="#cbd5e1" stroke-width="1"/>
+  <line x1="360" y1="38" x2="690" y2="38" stroke="#bfdbfe" stroke-width="1"/>
+  <defs>
+    <marker id="ma" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#6b7280"/>
+    </marker>
+  </defs>
+  <rect x="15"  y="52" width="290" height="46" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1" rx="8"/>
+  <text x="160" y="72" text-anchor="middle" font-size="12" fill="#1e293b">name string</text>
+  <text x="160" y="89" text-anchor="middle" font-size="10" fill="#64748b">"zcm_frame_slot"</text>
+  <line x1="307" y1="75" x2="383" y2="75" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ma)"/>
+  <text x="345" y="69" text-anchor="middle" font-size="9" fill="#6b7280">identifier</text>
+  <rect x="395" y="52" width="290" height="46" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1" rx="8"/>
+  <text x="540" y="72" text-anchor="middle" font-size="12" fill="#1e3a8a">object ID</text>
+  <text x="540" y="89" text-anchor="middle" font-size="10" fill="#3b82f6">28-byte unique ID (task-derived, not content hash)</text>
+  <rect x="15"  y="112" width="290" height="46" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1" rx="8"/>
+  <text x="160" y="132" text-anchor="middle" font-size="12" fill="#1e293b">shared memory block</text>
+  <text x="160" y="149" text-anchor="middle" font-size="10" fill="#64748b">raw bytes, 1 block per frame</text>
+  <line x1="307" y1="135" x2="383" y2="135" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ma)"/>
+  <text x="345" y="129" text-anchor="middle" font-size="9" fill="#6b7280">storage</text>
+  <rect x="395" y="112" width="290" height="46" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1" rx="8"/>
+  <text x="540" y="132" text-anchor="middle" font-size="12" fill="#1e3a8a">Plasma store</text>
+  <text x="540" y="149" text-anchor="middle" font-size="10" fill="#3b82f6">managed pool, Apache Arrow format</text>
+  <rect x="15"  y="172" width="290" height="46" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1" rx="8"/>
+  <text x="160" y="192" text-anchor="middle" font-size="12" fill="#1e293b">np.frombuffer(shm.buf)</text>
+  <text x="160" y="209" text-anchor="middle" font-size="10" fill="#64748b">zero-copy view into shared pages</text>
+  <line x1="307" y1="195" x2="383" y2="195" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ma)"/>
+  <text x="345" y="189" text-anchor="middle" font-size="9" fill="#6b7280">read</text>
+  <rect x="395" y="172" width="290" height="46" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1" rx="8"/>
+  <text x="540" y="192" text-anchor="middle" font-size="12" fill="#1e3a8a">ray.get(object_id)</text>
+  <text x="540" y="209" text-anchor="middle" font-size="10" fill="#3b82f6">same-node: mmap same pages</text>
+  <rect x="15"  y="232" width="290" height="46" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1" rx="8"/>
+  <text x="160" y="252" text-anchor="middle" font-size="12" fill="#1e293b">manual close() + unlink()</text>
+  <text x="160" y="269" text-anchor="middle" font-size="10" fill="#64748b">you decide when to free</text>
+  <line x1="307" y1="255" x2="383" y2="255" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ma)"/>
+  <text x="345" y="249" text-anchor="middle" font-size="9" fill="#6b7280">lifetime</text>
+  <rect x="395" y="232" width="290" height="46" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1" rx="8"/>
+  <text x="540" y="252" text-anchor="middle" font-size="12" fill="#1e3a8a">distributed reference counting</text>
+  <text x="540" y="269" text-anchor="middle" font-size="10" fill="#3b82f6">freed when no ObjectRef in scope</text>
+</svg>
+
+The physical law doesn't change — for same-node access. A tensor still moves from producer heap into the shared block exactly once. The consumer's virtual address is still a different number pointing to the same physical pages. Ray wraps all of this in a production API, but the OS primitive underneath is identical to what this experiment does.
+
+### Under the hood: how Plasma avoids locks
+
+The key difference from the ring buffer is that Plasma objects are **immutable once written**. A worker writes into a mutable Plasma buffer; the worker's own CoreWorker then **seals** it — a one-way transition that makes it permanently read-only. (The raylet embeds the Plasma store and manages the memory pool, but the seal call is issued by the producing worker's CoreWorker, not the raylet itself.) After sealing, any number of workers can call `ray.get()` simultaneously and each gets an mmap view to the same physical pages. Because no writer can ever touch the buffer again, concurrent reads need zero coordination.
+
+One practical consequence of immutability: `ray.get()` returns numpy arrays as **read-only** views into the shared buffer. Any attempt to write to them raises an error. That's why production Ray code nearly always ends with `arr = arr.copy()` before doing in-place work — the copy buys writability at the cost of one extra allocation, just like the `.copy()` calls in Method B above.
+
+<svg width="760" height="270" xmlns="http://www.w3.org/2000/svg">
+  <rect width="760" height="270" fill="#fafafa" rx="12"/>
+  <defs>
+    <marker id="sl-o" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ea580c"/></marker>
+    <marker id="sl-p" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#7c3aed"/></marker>
+    <marker id="sl-g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#16a34a"/></marker>
+  </defs>
+  <text x="105" y="22" text-anchor="middle" font-size="11" font-weight="bold" fill="#c2410c">① Write (single writer)</text>
+  <text x="283" y="22" text-anchor="middle" font-size="11" font-weight="bold" fill="#7c3aed">② Seal</text>
+  <text x="565" y="22" text-anchor="middle" font-size="11" font-weight="bold" fill="#15803d">③ Read (unlimited concurrent)</text>
+  <line x1="220" y1="30" x2="220" y2="195" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="360" y1="30" x2="360" y2="195" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="4,3"/>
+  <rect x="15" y="42" width="90" height="68" fill="#fff7ed" stroke="#f97316" stroke-width="1.5" rx="8"/>
+  <text x="60" y="64" text-anchor="middle" font-size="11" font-weight="bold" fill="#c2410c">Worker</text>
+  <text x="60" y="79" text-anchor="middle" font-size="9" fill="#9a3412">task executor</text>
+  <text x="60" y="93" text-anchor="middle" font-size="9" fill="#9a3412">one writer only</text>
+  <text x="60" y="105" text-anchor="middle" font-size="9" fill="#9a3412">per object</text>
+  <line x1="107" y1="76" x2="125" y2="76" stroke="#ea580c" stroke-width="1.5" marker-end="url(#sl-o)"/>
+  <rect x="127" y="32" width="90" height="95" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5" rx="8"/>
+  <text x="172" y="54" text-anchor="middle" font-size="10" font-weight="bold" fill="#c2410c">Plasma</text>
+  <text x="172" y="68" text-anchor="middle" font-size="9" fill="#c2410c">MUTABLE</text>
+  <rect x="138" y="76" width="70" height="16" fill="#fed7aa" stroke="#fb923c" stroke-width="1" rx="3"/>
+  <text x="172" y="88" text-anchor="middle" font-size="8" fill="#9a3412">writing…</text>
+  <text x="172" y="108" text-anchor="middle" font-size="8" fill="#9a3412">raylet serializes</text>
+  <text x="172" y="120" text-anchor="middle" font-size="8" fill="#9a3412">creation requests</text>
+  <rect x="228" y="38" width="78" height="82" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2" rx="8"/>
+  <text x="267" y="76" text-anchor="middle" font-size="11" font-weight="bold" fill="#7c3aed">seal()</text>
+  <text x="267" y="91" text-anchor="middle" font-size="9" fill="#6d28d9">one-way</text>
+  <text x="267" y="105" text-anchor="middle" font-size="9" fill="#6d28d9">no undo</text>
+  <line x1="219" y1="79" x2="226" y2="79" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#sl-p)"/>
+  <line x1="308" y1="79" x2="318" y2="79" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#sl-p)"/>
+  <rect x="320" y="32" width="100" height="95" fill="#dcfce7" stroke="#16a34a" stroke-width="2" rx="8"/>
+  <text x="370" y="54" text-anchor="middle" font-size="10" font-weight="bold" fill="#14532d">Plasma</text>
+  <text x="370" y="68" text-anchor="middle" font-size="10" font-weight="bold" fill="#14532d">IMMUTABLE</text>
+  <rect x="332" y="76" width="76" height="16" fill="#bbf7d0" stroke="#86efac" stroke-width="1" rx="3"/>
+  <text x="370" y="88" text-anchor="middle" font-size="8" font-family="monospace" fill="#14532d">0xABCD0000</text>
+  <text x="370" y="108" text-anchor="middle" font-size="8" fill="#15803d">no writer can</text>
+  <text x="370" y="120" text-anchor="middle" font-size="8" fill="#15803d">touch this</text>
+  <line x1="422" y1="79" x2="458" y2="52" stroke="#16a34a" stroke-width="1.5" marker-end="url(#sl-g)"/>
+  <line x1="422" y1="79" x2="458" y2="96" stroke="#16a34a" stroke-width="1.5" marker-end="url(#sl-g)"/>
+  <line x1="422" y1="79" x2="458" y2="140" stroke="#16a34a" stroke-width="1.5" marker-end="url(#sl-g)"/>
+  <text x="440" y="56" text-anchor="middle" font-size="8" fill="#15803d">mmap</text>
+  <rect x="460" y="35" width="150" height="36" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5" rx="6"/>
+  <text x="535" y="51" text-anchor="middle" font-size="10" font-weight="bold" fill="#1e40af">Worker A</text>
+  <text x="535" y="63" text-anchor="middle" font-size="8" fill="#3b82f6">vaddr 0x7f1a… → same pages</text>
+  <rect x="460" y="78" width="150" height="36" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5" rx="6"/>
+  <text x="535" y="94" text-anchor="middle" font-size="10" font-weight="bold" fill="#1e40af">Worker B</text>
+  <text x="535" y="106" text-anchor="middle" font-size="8" fill="#3b82f6">vaddr 0x7f2b… → same pages</text>
+  <rect x="460" y="121" width="150" height="36" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5" rx="6"/>
+  <text x="535" y="137" text-anchor="middle" font-size="10" font-weight="bold" fill="#1e40af">Worker C</text>
+  <text x="535" y="149" text-anchor="middle" font-size="8" fill="#3b82f6">vaddr 0x7f3c… → same pages</text>
+  <rect x="624" y="88" width="122" height="22" fill="#f0fdf4" stroke="#86efac" stroke-width="1" rx="11"/>
+  <text x="685" y="103" text-anchor="middle" font-size="10" font-weight="bold" fill="#15803d">0 locks needed</text>
+  <rect x="10" y="207" width="740" height="52" fill="#f0f4ff" stroke="#c7d2fe" stroke-width="1" rx="8"/>
+  <text x="380" y="226" text-anchor="middle" font-size="11" font-weight="bold" fill="#3730a3">Seal makes write and read non-overlapping by construction — no writer exists during reads, so nothing can race</text>
+  <text x="380" y="244" text-anchor="middle" font-size="10" fill="#4338ca">Ring buffer: slots reused → needs lock/atomic on every state transition</text>
+  <text x="380" y="258" text-anchor="middle" font-size="10" fill="#4338ca">Plasma: immutable after seal → concurrent reads are trivially safe, no coordination needed</text>
+</svg>
+
+This is the opposite trade-off from the ring buffer:
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700;width:22%"></th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Ring buffer</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Plasma (Ray)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Slot lifecycle</td>
+      <td style="padding:9px 14px"><code>READING → EMPTY → WRITING</code> (reused)</td>
+      <td style="padding:9px 14px">Write once, sealed → immutable forever</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Concurrent readers</td>
+      <td style="padding:9px 14px">1 reader per slot at a time</td>
+      <td style="padding:9px 14px;color:#16a34a;font-weight:600">Unlimited — no coordination needed</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Coordination</td>
+      <td style="padding:9px 14px">Lock or atomic on every state transition</td>
+      <td style="padding:9px 14px;color:#16a34a;font-weight:600">None after seal</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Memory use</td>
+      <td style="padding:9px 14px">Fixed N-slot pool, bounded</td>
+      <td style="padding:9px 14px">Objects live until all refs hit zero across cluster</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Best suited for</td>
+      <td style="padding:9px 14px">Streaming pipelines with fixed-size frames</td>
+      <td style="padding:9px 14px">Arbitrary objects shared across many workers</td>
+    </tr>
+  </tbody>
+</table>
+
+**When to free: distributed reference counting**
+
+Since objects are never overwritten, Ray needs a distributed protocol to decide when to free the physical pages. Every `ObjectRef` has an **owner** — the worker that created it — who tracks five reference count components. The object is freed only when all reach zero across the entire cluster.
+
+<svg width="680" height="258" xmlns="http://www.w3.org/2000/svg">
+  <rect width="680" height="258" fill="#fafafa" rx="12"/>
+  <defs>
+    <marker id="rc-dn" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6b7280"/></marker>
+    <marker id="rc-up" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#dc2626"/></marker>
+  </defs>
+  <rect x="130" y="18" width="420" height="95" fill="#eff6ff" stroke="#2563eb" stroke-width="2" rx="8"/>
+  <text x="340" y="40" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">Owner Worker</text>
+  <text x="340" y="57" text-anchor="middle" font-size="9" fill="#1e40af">Tracks 5 ref count components per ObjectRef:</text>
+  <text x="340" y="71" text-anchor="middle" font-size="9" fill="#3b82f6">local Python count · submitted task count · borrower set · nested count · lineage count</text>
+  <rect x="145" y="79" width="390" height="20" fill="#dbeafe" stroke="#93c5fd" stroke-width="1" rx="4"/>
+  <text x="340" y="93" text-anchor="middle" font-size="9" fill="#1e40af">Object freed when ALL = 0 across ALL processes in the cluster</text>
+  <line x1="225" y1="115" x2="192" y2="148" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#rc-dn)"/>
+  <text x="192" y="135" text-anchor="middle" font-size="8" fill="#64748b">pass as task arg</text>
+  <line x1="455" y1="115" x2="488" y2="148" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#rc-dn)"/>
+  <text x="490" y="135" text-anchor="middle" font-size="8" fill="#64748b">pass as task arg</text>
+  <rect x="45" y="150" width="230" height="72" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5" rx="8"/>
+  <text x="160" y="171" text-anchor="middle" font-size="11" font-weight="bold" fill="#14532d">Borrower A</text>
+  <text x="160" y="187" text-anchor="middle" font-size="9" fill="#15803d">maintains own local ref count</text>
+  <text x="160" y="201" text-anchor="middle" font-size="9" fill="#15803d">notifies owner when count → 0</text>
+  <text x="160" y="215" text-anchor="middle" font-size="8" fill="#86efac">(async RPC back to owner)</text>
+  <rect x="405" y="150" width="230" height="72" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5" rx="8"/>
+  <text x="520" y="171" text-anchor="middle" font-size="11" font-weight="bold" fill="#14532d">Borrower B</text>
+  <text x="520" y="187" text-anchor="middle" font-size="9" fill="#15803d">maintains own local ref count</text>
+  <text x="520" y="201" text-anchor="middle" font-size="9" fill="#15803d">notifies owner when count → 0</text>
+  <text x="520" y="215" text-anchor="middle" font-size="8" fill="#15803d">(can recursively pass to Borrower C)</text>
+  <line x1="183" y1="148" x2="228" y2="115" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#rc-up)"/>
+  <text x="196" y="127" text-anchor="middle" font-size="8" fill="#dc2626">count = 0</text>
+  <line x1="497" y1="148" x2="452" y2="115" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#rc-up)"/>
+  <text x="484" y="127" text-anchor="middle" font-size="8" fill="#dc2626">count = 0</text>
+  <rect x="10" y="234" width="660" height="16" fill="#fef2f2" stroke="#fca5a5" stroke-width="1" rx="6"/>
+  <text x="340" y="246" text-anchor="middle" font-size="9" fill="#dc2626">Raylet frees /dev/shm pages only after owner + all borrowers (recursively) have reported count = 0</text>
+</svg>
+
+When an `ObjectRef` is passed to another process as a task argument, that process becomes a **borrower**. The owner adds it to a borrower set and waits for a "count = 0" report via async RPC. Borrowers chain recursively — if B passes the ref to C, B includes C in its reply to the owner, who then contacts C directly. Only once every count is zero does the raylet free the `/dev/shm` pages.
+
+---
+
+## Putting it all together
+
+The diagram below maps the five lifecycle steps — allocate, write, signal, read, free — across both approaches side by side. The amber box is where the designs diverge most sharply: a raw pipe signal versus Plasma's seal primitive.
+
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="980" viewBox="0 0 780 980">
+<defs><marker id="arr" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7 Z" fill="#94a3b8"/></marker></defs>
+<rect x="0" y="0" width="780" height="980" rx="10" fill="#f8fafc" stroke="none" stroke-width="2" opacity="1.0"/>
+<rect x="25" y="8" width="330" height="70" rx="10" fill="#1e40af" stroke="#1e40af" stroke-width="2" opacity="1.0"/>
+<text x="190" y="34" font-size="15" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">My Experiment (Method B)</text>
+<text x="190" y="54" font-size="11" font-weight="normal" fill="#bfdbfe" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">shared memory + pipe signal</text>
+<rect x="425" y="8" width="330" height="70" rx="10" fill="#6d28d9" stroke="#6d28d9" stroke-width="2" opacity="1.0"/>
+<text x="590" y="34" font-size="15" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">Ray (same node)</text>
+<text x="590" y="54" font-size="11" font-weight="normal" fill="#ddd6fe" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">Plasma object store</text>
+<line x1="390" y1="0" x2="390" y2="980" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="6,4"/>
+<rect x="0" y="421" width="780" height="14" rx="0" fill="#fef3c7" stroke="none" stroke-width="0" opacity="1.0"/>
+<text x="390" y="431" font-size="10" font-weight="bold" fill="#92400e" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">-- KEY DIFFERENCE --</text>
+<rect x="25" y="90" width="330" height="158" rx="10" fill="white" stroke="#1e40af" stroke-width="2" opacity="1.0"/>
+<rect x="25" y="90" width="330" height="30" rx="10" fill="#1e40af" stroke="#1e40af" stroke-width="2" opacity="1.0"/>
+<rect x="25" y="110" width="330" height="12" rx="0" fill="#1e40af" stroke="none" stroke-width="0" opacity="1.0"/>
+<circle cx="47" cy="105" r="12" fill="rgba(255,255,255,0.35)"/><text x="47" y="110" font-size="13" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">1</text>
+<text x="67" y="109" font-size="14" font-weight="bold" fill="white" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Allocate</text>
+<text x="39" y="136" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">SharedMemory(name='zcm', create=True)</text>
+<text x="39" y="153" font-size="11" font-weight="normal" fill="#1d4ed8" text-anchor="start" font-family="Arial,Helvetica,sans-serif">shm_open() + ftruncate() + mmap()</text>
+<text x="39" y="170" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">pages lazy-faulted on first write</text>
+<rect x="425" y="90" width="330" height="158" rx="10" fill="white" stroke="#6d28d9" stroke-width="2" opacity="1.0"/>
+<rect x="425" y="90" width="330" height="30" rx="10" fill="#6d28d9" stroke="#6d28d9" stroke-width="2" opacity="1.0"/>
+<rect x="425" y="110" width="330" height="12" rx="0" fill="#6d28d9" stroke="none" stroke-width="0" opacity="1.0"/>
+<circle cx="447" cy="105" r="12" fill="rgba(255,255,255,0.35)"/><text x="447" y="110" font-size="13" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">1</text>
+<text x="467" y="109" font-size="14" font-weight="bold" fill="white" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Allocate</text>
+<text x="439" y="136" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Plasma pool pre-allocated at Ray startup</text>
+<text x="439" y="153" font-size="11" font-weight="normal" fill="#1d4ed8" text-anchor="start" font-family="Arial,Helvetica,sans-serif">raylet owns shm_open()+mmap() for pool</text>
+<text x="439" y="170" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">objects carved from fixed-size pool</text>
+<line x1="190" y1="249" x2="190" y2="261" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr)"/>
+<line x1="590" y1="249" x2="590" y2="261" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr)"/>
+<rect x="25" y="262" width="330" height="158" rx="10" fill="white" stroke="#1e40af" stroke-width="2" opacity="1.0"/>
+<rect x="25" y="262" width="330" height="30" rx="10" fill="#1e40af" stroke="#1e40af" stroke-width="2" opacity="1.0"/>
+<rect x="25" y="282" width="330" height="12" rx="0" fill="#1e40af" stroke="none" stroke-width="0" opacity="1.0"/>
+<circle cx="47" cy="277" r="12" fill="rgba(255,255,255,0.35)"/><text x="47" y="282" font-size="13" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">2</text>
+<text x="67" y="281" font-size="14" font-weight="bold" fill="white" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Write</text>
+<text x="39" y="308" font-size="11" font-weight="normal" fill="#1d4ed8" text-anchor="start" font-family="Arial,Helvetica,sans-serif">buf[:FRAME_BYTES] = rgb.ravel()</text>
+<text x="39" y="325" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">heap -&gt; shm: 1 user-space copy</text>
+<text x="39" y="342" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">no kernel crossing</text>
+<rect x="425" y="262" width="330" height="158" rx="10" fill="white" stroke="#6d28d9" stroke-width="2" opacity="1.0"/>
+<rect x="425" y="262" width="330" height="30" rx="10" fill="#6d28d9" stroke="#6d28d9" stroke-width="2" opacity="1.0"/>
+<rect x="425" y="282" width="330" height="12" rx="0" fill="#6d28d9" stroke="none" stroke-width="0" opacity="1.0"/>
+<circle cx="447" cy="277" r="12" fill="rgba(255,255,255,0.35)"/><text x="447" y="282" font-size="13" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">2</text>
+<text x="467" y="281" font-size="14" font-weight="bold" fill="white" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Write</text>
+<text x="439" y="308" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">data written to: Plasma buffer</text>
+<text x="439" y="325" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">  (raylet shared memory, /dev/shm)</text>
+<text x="439" y="342" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">heap -&gt; Plasma: 1 user-space copy</text>
+<text x="439" y="359" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">no kernel crossing</text>
+<line x1="190" y1="421" x2="190" y2="433" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr)"/>
+<line x1="590" y1="421" x2="590" y2="433" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr)"/>
+<rect x="25" y="434" width="330" height="158" rx="10" fill="white" stroke="#d97706" stroke-width="3" opacity="1.0"/>
+<rect x="25" y="434" width="330" height="30" rx="10" fill="#d97706" stroke="#d97706" stroke-width="3" opacity="1.0"/>
+<rect x="25" y="454" width="330" height="12" rx="0" fill="#d97706" stroke="none" stroke-width="0" opacity="1.0"/>
+<circle cx="47" cy="449" r="12" fill="white"/><text x="47" y="454" font-size="13" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">3</text>
+<text x="67" y="453" font-size="14" font-weight="bold" fill="white" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Signal</text>
+<text x="39" y="480" font-size="11" font-weight="normal" fill="#1d4ed8" text-anchor="start" font-family="Arial,Helvetica,sans-serif">conn.send('ready')  # pipe syscall</text>
+<text x="39" y="497" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">carries ~5 bytes, not 7.3 MB</text>
+<text x="39" y="514" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">no ObjectRef concept -- raw signal</text>
+<rect x="35" y="557" width="310" height="18" rx="4" fill="#fef3c7" stroke="#d97706" stroke-width="1" opacity="1.0"/>
+<text x="40" y="570" font-size="10" font-weight="normal" fill="#92400e" text-anchor="start" font-family="Arial,Helvetica,sans-serif">[!] single slot: race condition risk</text>
+<rect x="425" y="434" width="330" height="158" rx="10" fill="white" stroke="#d97706" stroke-width="3" opacity="1.0"/>
+<rect x="425" y="434" width="330" height="30" rx="10" fill="#d97706" stroke="#d97706" stroke-width="3" opacity="1.0"/>
+<rect x="425" y="454" width="330" height="12" rx="0" fill="#d97706" stroke="none" stroke-width="0" opacity="1.0"/>
+<circle cx="447" cy="449" r="12" fill="white"/><text x="447" y="454" font-size="13" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">3</text>
+<text x="467" y="453" font-size="14" font-weight="bold" fill="white" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Seal + ObjectRef</text>
+<text x="439" y="480" font-size="11" font-weight="normal" fill="#1d4ed8" text-anchor="start" font-family="Arial,Helvetica,sans-serif">worker seals Plasma buffer: MUTABLE-&gt;IMMUTABLE</text>
+<text x="439" y="497" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">metadata written to: owner CoreWorker heap</text>
+<text x="439" y="514" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">  ownership table: ID-&gt;Plasma addr, rc=1</text>
+<text x="439" y="531" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">ObjectRef = {"{"}28-byte ID + owner addr{"}"}</text>
+<rect x="435" y="557" width="310" height="18" rx="4" fill="#dcfce7" stroke="#16a34a" stroke-width="1" opacity="1.0"/>
+<text x="440" y="570" font-size="10" font-weight="normal" fill="#166534" text-anchor="start" font-family="Arial,Helvetica,sans-serif">multi-reader safe by construction</text>
+<line x1="190" y1="593" x2="190" y2="605" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr)"/>
+<line x1="590" y1="593" x2="590" y2="605" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr)"/>
+<rect x="25" y="606" width="330" height="158" rx="10" fill="white" stroke="#1e40af" stroke-width="2" opacity="1.0"/>
+<rect x="25" y="606" width="330" height="30" rx="10" fill="#1e40af" stroke="#1e40af" stroke-width="2" opacity="1.0"/>
+<rect x="25" y="626" width="330" height="12" rx="0" fill="#1e40af" stroke="none" stroke-width="0" opacity="1.0"/>
+<circle cx="47" cy="621" r="12" fill="rgba(255,255,255,0.35)"/><text x="47" y="626" font-size="13" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">4</text>
+<text x="67" y="625" font-size="14" font-weight="bold" fill="white" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Read</text>
+<text x="39" y="652" font-size="11" font-weight="normal" fill="#1d4ed8" text-anchor="start" font-family="Arial,Helvetica,sans-serif">np.frombuffer(shm.buf).reshape(...)</text>
+<text x="39" y="669" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">mmap: same physical pages as producer</text>
+<text x="39" y="686" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">zero-copy, no kernel crossing</text>
+<rect x="425" y="606" width="330" height="158" rx="10" fill="white" stroke="#6d28d9" stroke-width="2" opacity="1.0"/>
+<rect x="425" y="606" width="330" height="30" rx="10" fill="#6d28d9" stroke="#6d28d9" stroke-width="2" opacity="1.0"/>
+<rect x="425" y="626" width="330" height="12" rx="0" fill="#6d28d9" stroke="none" stroke-width="0" opacity="1.0"/>
+<circle cx="447" cy="621" r="12" fill="rgba(255,255,255,0.35)"/><text x="447" y="626" font-size="13" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">4</text>
+<text x="467" y="625" font-size="14" font-weight="bold" fill="white" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Read</text>
+<text x="439" y="652" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">metadata read from: owner CoreWorker heap</text>
+<text x="439" y="669" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">  ownership table -&gt; finds Plasma addr</text>
+<text x="439" y="686" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">data read from: Plasma buffer via mmap(fd)</text>
+<text x="439" y="703" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">  same physical pages, zero-copy</text>
+<line x1="190" y1="765" x2="190" y2="777" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr)"/>
+<line x1="590" y1="765" x2="590" y2="777" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr)"/>
+<rect x="25" y="778" width="330" height="158" rx="10" fill="white" stroke="#1e40af" stroke-width="2" opacity="1.0"/>
+<rect x="25" y="778" width="330" height="30" rx="10" fill="#1e40af" stroke="#1e40af" stroke-width="2" opacity="1.0"/>
+<rect x="25" y="798" width="330" height="12" rx="0" fill="#1e40af" stroke="none" stroke-width="0" opacity="1.0"/>
+<circle cx="47" cy="793" r="12" fill="rgba(255,255,255,0.35)"/><text x="47" y="798" font-size="13" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">5</text>
+<text x="67" y="797" font-size="14" font-weight="bold" fill="white" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Free</text>
+<text x="39" y="824" font-size="11" font-weight="normal" fill="#1d4ed8" text-anchor="start" font-family="Arial,Helvetica,sans-serif">shm.close()   # munmap</text>
+<text x="39" y="841" font-size="11" font-weight="normal" fill="#1d4ed8" text-anchor="start" font-family="Arial,Helvetica,sans-serif">shm.unlink()  # delete /dev/shm</text>
+<text x="39" y="858" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">manual: you decide when to free</text>
+<rect x="425" y="778" width="330" height="158" rx="10" fill="white" stroke="#6d28d9" stroke-width="2" opacity="1.0"/>
+<rect x="425" y="778" width="330" height="30" rx="10" fill="#6d28d9" stroke="#6d28d9" stroke-width="2" opacity="1.0"/>
+<rect x="425" y="798" width="330" height="12" rx="0" fill="#6d28d9" stroke="none" stroke-width="0" opacity="1.0"/>
+<circle cx="447" cy="793" r="12" fill="rgba(255,255,255,0.35)"/><text x="447" y="798" font-size="13" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial,Helvetica,sans-serif">5</text>
+<text x="467" y="797" font-size="14" font-weight="bold" fill="white" text-anchor="start" font-family="Arial,Helvetica,sans-serif">Free</text>
+<text x="439" y="824" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">ownership table tracks ref count</text>
+<text x="439" y="841" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">borrowers report back via async RPC</text>
+<text x="439" y="858" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">count=0 across all -&gt; Plasma frees pages</text>
+<text x="439" y="875" font-size="12" font-weight="normal" fill="#1e293b" text-anchor="start" font-family="Arial,Helvetica,sans-serif">automatic, distributed GC</text>
+</svg>
+
+---
+
+## Summary
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700;width:22%"></th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Pipe + pickle</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Shared memory</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Serialization</td>
+      <td style="padding:9px 14px;color:#dc2626">pickle dumps/loads (CPU cost)</td>
+      <td style="padding:9px 14px;color:#16a34a;font-weight:600">None</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Data copies</td>
+      <td style="padding:9px 14px;color:#dc2626">2 (kernel in + kernel out)</td>
+      <td style="padding:9px 14px;color:#16a34a;font-weight:600">0</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Signaling</td>
+      <td style="padding:9px 14px">Implicit — data is the signal</td>
+      <td style="padding:9px 14px">Explicit — name string or atomic flag</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">N producers</td>
+      <td style="padding:9px 14px;color:#16a34a">Safe — pipe handles queuing</td>
+      <td style="padding:9px 14px;color:#d97706">Needs MPSC design</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Backpressure</td>
+      <td style="padding:9px 14px">None — pipe buffer absorbs bursts</td>
+      <td style="padding:9px 14px">Explicit — drop or pause producer</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:700;background:#f8fafc">Real-world example</td>
+      <td style="padding:9px 14px">—</td>
+      <td style="padding:9px 14px">Ray Plasma, PyTorch DataLoader shm mode</td>
+    </tr>
+  </tbody>
+</table>
+
+The core insight is that "passing a tensor between processes" is not one problem — it's three: **serialization**, **copying**, and **signaling**. Pipe + pickle bundles all three into one opaque call. Shared memory forces you to handle each one explicitly, which is exactly why it's worth understanding.
