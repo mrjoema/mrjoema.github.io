@@ -3,3 +3,6 @@
 
 export const SITE_TITLE = "Joe Ma's Tech Blog";
 export const SITE_DESCRIPTION = 'Articles, showcases, and experiments by Hok Yin Ma.';
+
+const raw = import.meta.env.BASE_URL;
+export const BASE = raw.endsWith('/') ? raw : raw + '/';
