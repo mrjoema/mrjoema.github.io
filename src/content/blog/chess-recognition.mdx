@@ -6,7 +6,12 @@ type: 'article'
 tags: ['python', 'computer-vision', 'deep-learning', 'chess', 'pytorch']
 ---
 
-Here are the numbers before anything else. Given a 1920×1080 rendered chessboard image, the system outputs a FEN string describing every piece position:
+This was built for an online chess-recognition challenge: given rendered chessboard images from a held-out test set, predict the FEN string for each position. The evaluator scores two things — per-square accuracy and full-board accuracy — and returns results in real time. Here is what the submission page showed:
+
+<figure style="margin:1.25rem 0">
+  <img src="/chess-recognition/challenge-result.png" alt="Online challenge evaluator output: ACCURACY 96.00%, PIECE ACCURACY 99.85%, IMAGES EVALUATED 3072, TOTAL TIME 175.28s" style="max-width:480px;border-radius:6px;border:1px solid #2a2a2a"/>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">The online challenge evaluator output — scores computed on 3,072 held-out images the model had never seen.</figcaption>
+</figure>
 
 <table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
   <thead>
@@ -43,9 +48,7 @@ Here are the numbers before anything else. Given a 1920×1080 rendered chessboar
   </tbody>
 </table>
 
-96% full-board means roughly 96 out of 100 boards have all 64 squares predicted correctly — zero errors anywhere on the board. That number is hard to reach because one wrong square fails the whole board. The per-square number (99.85%) tells you the per-cell error rate is about 1.5 in 1,000.
-
-This post is a walkthrough of every design decision that got there, with the paper that justified each one.
+96% full-board means roughly 96 out of 100 boards have every single square correct — one wrong square fails the whole board. The per-square rate (99.85%) puts the per-cell error at about 1.5 in 1,000. This post is a walkthrough of every design decision that got there, with the paper that justified each one.
 
 ---
 
@@ -56,6 +59,11 @@ The task: given one top-down rendered PNG of a chessboard, predict the FEN piece
 **What is FEN?** FEN (Forsyth–Edwards Notation) is a compact way to describe where every piece sits on a chessboard. A string like `rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR` encodes all 64 squares — uppercase for white pieces, lowercase for black, digits for runs of empty squares. One FEN string = one complete board position.
 
 There are **13 possible classes per square**: empty, plus the 12 piece types (K Q R B N P in upper and lower case).
+
+<figure style="margin:1.5rem 0">
+  <img src="/chess-recognition/training-sample.png" alt="Three-panel view of training data: raw perspective image (left), warped top-down canonical view (centre), augmented version (right)" style="max-width:100%;border-radius:6px;border:1px solid #e2e8f0"/>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">A sample from the training set. Left: the raw 1920×1080 input from a fixed camera angle. Centre: after homography warp to 512×512. Right: augmented variant used during training (colour jitter + horizontal flip with mirrored FEN labels).</figcaption>
+</figure>
 
 **Why is full-board accuracy the right metric?** A model that is 99% per-square accurate but consistently wrong on one square per board scores 0% full-board. Every square must be correct for the board to be usable. Per-square accuracy is a training signal; full-board accuracy is the real-world score.
 
@@ -288,6 +296,11 @@ Before building the model, I averaged 200 training images pixel-by-pixel. If the
 
 The average image showed a crystal-clear board outline and completely blurred pieces. One observation, two architectural decisions:
 
+<figure style="margin:1.5rem 0">
+  <img src="/chess-recognition/pixel-mean.png" alt="Pixel-average of 200 training images showing sharp board surface and ghost-like blurred pieces" style="max-width:100%;border-radius:6px;border:1px solid #e2e8f0"/>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">Pixel average of 200 training images. The board surface is razor-sharp (camera never moves). The pieces are transparent ghosts — they appear in different positions across images, so they average out. This single observation confirmed a fixed camera and unlocked the cached homography optimisation.</figcaption>
+</figure>
+
 **1. Cached homography.** A homography is a 3×3 matrix that maps points on a tilted plane to a flat top-down view. `cv2.getPerspectiveTransform` computes the matrix from the four board corners, mapping the board to a 512×512 canonical view where each square occupies exactly 64×64 pixels. Because the camera never moves, compute this matrix once and reuse it for every image.
 
 <svg viewBox="0 0 780 270" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
@@ -348,6 +361,11 @@ The average image showed a crystal-clear board outline and completely blurred pi
     <line x1="510" y1="212" x2="710" y2="212"/>
   </g>
 </svg>
+
+<figure style="margin:1.5rem 0">
+  <img src="/chess-recognition/corner-detection.png" alt="Training image with four red corner dots marking the board corners and a green grid overlay showing the 8×8 square grid" style="max-width:100%;border-radius:6px;border:1px solid #e2e8f0"/>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">Corner detection output: the four red dots are the board corners fed to <code>cv2.getPerspectiveTransform</code>. The green grid shows the resulting 8×8 projection — each cell maps to exactly one chess square in the warped 512×512 image. This matrix is computed once and cached for all subsequent frames.</figcaption>
+</figure>
 
 Chesscog needed a full detection pipeline for board localization. This project skips it entirely — the cached homography does the job in microseconds.
 
@@ -716,6 +734,11 @@ In practice, this never ran more than 2 iterations on the validation set.
 ---
 
 ## Results
+
+<figure style="margin:1.5rem 0">
+  <img src="/chess-recognition/eval-results.png" alt="Evaluation output showing 96.00% accuracy, 99.85% piece accuracy, 3072 images evaluated, 175.28s total time" style="max-width:480px;border-radius:6px;border:1px solid #e2e8f0"/>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">Final evaluation run against the 3,072-image held-out test set. All numbers in this post come from this output.</figcaption>
+</figure>
 
 Training results from `runs/v1/history.json`:
 
