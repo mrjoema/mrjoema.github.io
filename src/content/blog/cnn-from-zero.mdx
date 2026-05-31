@@ -1,6 +1,6 @@
 ---
 title: 'CNN from 0 — why convolutional networks exist and what every layer actually does'
-description: 'A from-scratch tour of convolutional neural networks for interview prep: why they replaced manual feature engineering, what every layer does, how the network actually learns (softmax, cross-entropy, backprop), and how it assembles into a working VGG. Inline diagrams, the math behind each layer, and a quick interview self-check.'
+description: 'A from-scratch tour of convolutional neural networks: why they replaced manual feature engineering, what every layer does, how the network actually learns (softmax, cross-entropy, backprop), and how it assembles into a working VGG. Inline diagrams and the math behind each layer.'
 pubDate: '2026-05-31'
 type: 'concept'
 tags: ['aiml']
@@ -201,7 +201,59 @@ The diagram below shows one 3×3 kernel sliding over the image. At each stop it 
   <text x="380" y="285" text-anchor="middle" font-size="11" fill="#666" font-style="italic" font-family="sans-serif">The same 9 weights are reused at every position — that weight sharing is why CNNs need so few parameters.</text>
 </svg>
 
-> **Interview favorite — why not just use a fully-connected layer on the image?** Two reasons, both rooted in the weight sharing above. **Parameters:** one fully-connected layer mapping a 224×224×3 image to 4096 units needs 224·224·3·4096 ≈ **616 million** weights; a single 3×3 conv with 64 filters needs 3·3·3·64 = **1,728**. The kernel is reused at every position instead of learning a separate weight per pixel. **Generalization:** because the same kernel slides everywhere, a feature learned in one spot is detected everywhere — the layer is *translation-equivariant* and never has to re-learn "cat ear" for each pixel.
+### Why did the map shrink (6×6 → 4×4)? Padding
+
+Notice the feature map above came out *smaller* than the input — even though this is convolution, **not** a pooling/downsampling step. That shrinkage is a **border effect**, not intentional downsampling: a 3×3 kernel only produces an output where **all 9 of its cells land on real pixels**. Centered on an edge pixel, part of the kernel would hang off the image with nothing to multiply — so the kernel's center can only visit the *interior* positions, dropping `k − 1` pixels along each axis (1 per side for a 3×3 → `6 → 4`). This is called **"valid"** convolution.
+
+The fix is **padding** — add a ring of zeros around the image so the kernel *can* be centered on the edge pixels. With `padding = (k−1)/2` (= 1 for a 3×3), the output matches the input size; this is **"same"** convolution.
+
+<svg viewBox="0 0 760 290" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
+  <g font-family="sans-serif">
+    {/* ===== LEFT: valid (no padding) ===== */}
+    <text x="150" y="26" text-anchor="middle" font-size="13" font-weight="800" fill="#b21e1e">"valid" — no padding</text>
+    <text x="150" y="44" text-anchor="middle" font-size="10" fill="#555">kernel must fit fully → border lost</text>
+
+    {/* 6x6 grid */}
+    <rect x="78" y="60" width="144" height="144" fill="#f1f5f9" stroke="#94a3b8"/>
+    <g stroke="#cbd5e1" stroke-width="1">
+      <line x1="102" y1="60" x2="102" y2="204"/><line x1="126" y1="60" x2="126" y2="204"/><line x1="150" y1="60" x2="150" y2="204"/><line x1="174" y1="60" x2="174" y2="204"/><line x1="198" y1="60" x2="198" y2="204"/>
+      <line x1="78" y1="84" x2="222" y2="84"/><line x1="78" y1="108" x2="222" y2="108"/><line x1="78" y1="132" x2="222" y2="132"/><line x1="78" y1="156" x2="222" y2="156"/><line x1="78" y1="180" x2="222" y2="180"/>
+    </g>
+    {/* valid 4x4 centers */}
+    <rect x="102" y="84" width="96" height="96" fill="#1f6feb" fill-opacity="0.18" stroke="#1f6feb" stroke-width="2"/>
+    <text x="150" y="138" text-anchor="middle" font-size="10" fill="#1f6feb" font-weight="700">valid 4×4</text>
+    {/* kernel hanging off the top-left corner */}
+    <rect x="54" y="36" width="72" height="72" fill="none" stroke="#b21e1e" stroke-width="2.5" stroke-dasharray="5 3"/>
+    <text x="62" y="32" font-size="14" font-weight="800" fill="#b21e1e">✗</text>
+    <text x="150" y="226" text-anchor="middle" font-size="11" font-weight="700">6×6 → 4×4</text>
+    <text x="150" y="244" text-anchor="middle" font-size="9" fill="#555">O = (6 − 3)/1 + 1 = 4</text>
+
+    {/* divider */}
+    <line x1="380" y1="55" x2="380" y2="250" stroke="#e2e8f0" stroke-width="1.5"/>
+
+    {/* ===== RIGHT: same (padding=1) ===== */}
+    <text x="585" y="26" text-anchor="middle" font-size="13" font-weight="800" fill="#1c7c2e">"same" — padding = 1</text>
+    <text x="585" y="44" text-anchor="middle" font-size="10" fill="#555">zero ring lets the kernel reach the edge</text>
+
+    {/* 8x8 padded grid: outer ring = padding */}
+    <rect x="489" y="60" width="192" height="192" fill="#fff7ed" stroke="#b66f00" stroke-dasharray="4 3"/>
+    {/* inner 6x6 real pixels */}
+    <rect x="513" y="84" width="144" height="144" fill="#f1f5f9" stroke="#94a3b8"/>
+    <g stroke="#cbd5e1" stroke-width="1">
+      <line x1="537" y1="84" x2="537" y2="228"/><line x1="561" y1="84" x2="561" y2="228"/><line x1="585" y1="84" x2="585" y2="228"/><line x1="609" y1="84" x2="609" y2="228"/><line x1="633" y1="84" x2="633" y2="228"/>
+      <line x1="513" y1="108" x2="657" y2="108"/><line x1="513" y1="132" x2="657" y2="132"/><line x1="513" y1="156" x2="657" y2="156"/><line x1="513" y1="180" x2="657" y2="180"/><line x1="513" y1="204" x2="657" y2="204"/>
+    </g>
+    {/* kernel can now center on the corner pixel */}
+    <rect x="489" y="60" width="72" height="72" fill="#1c7c2e" fill-opacity="0.15" stroke="#1c7c2e" stroke-width="2.5"/>
+    <text x="497" y="56" font-size="14" font-weight="800" fill="#1c7c2e">✓</text>
+    <text x="585" y="270" text-anchor="middle" font-size="11" font-weight="700">6×6 → 6×6</text>
+    <text x="700" y="74" font-size="9" fill="#b66f00">0 = padding</text>
+  </g>
+</svg>
+
+This is exactly why **VGG sets `padding=1` on every 3×3 conv** (`nn.Conv2d(in, out, 3, padding=1)` in the code): the convolutions *preserve* spatial size, so the clean `32 → 16 → 8 → 4 → 2` progression in the end-to-end diagram comes **entirely from the pooling layers** — never from the convolutions. (The diagram above uses the no-padding case just to make the sliding mechanic visible.)
+
+> **Why not just use a fully-connected layer on the image?** Two reasons, both rooted in the weight sharing above. **Parameters:** one fully-connected layer mapping a 224×224×3 image to 4096 units needs 224·224·3·4096 ≈ **616 million** weights; a single 3×3 conv with 64 filters needs 3·3·3·64 = **1,728**. The kernel is reused at every position instead of learning a separate weight per pixel. **Generalization:** because the same kernel slides everywhere, a feature learned in one spot is detected everywhere — the layer is *translation-equivariant* and never has to re-learn "cat ear" for each pixel.
 
 ### A feature map is a 3D volume — a cluster of cubes
 
@@ -473,7 +525,7 @@ no learnable parameters — pooling is a fixed reduction.
   <text x="410" y="205" text-anchor="middle" font-size="11" fill="#666" font-style="italic" font-family="sans-serif">keep the max of each colored 2×2 block</text>
 </svg>
 
-> **Equivariance vs invariance (a subtle, frequently-asked distinction):** convolution is *translation-equivariant* — shift the input and the feature map shifts the same way. Pooling adds a dose of *translation invariance* — a feature that moves within a pooling window gives the same output. A CNN's robustness to small shifts comes from this combination, not from convolution alone.
+> **Equivariance vs invariance:** convolution is *translation-equivariant* — shift the input and the feature map shifts the same way. Pooling adds a dose of *translation invariance* — a feature that moves within a pooling window gives the same output. A CNN's robustness to small shifts comes from this combination, not from convolution alone.
 
 ---
 
@@ -543,7 +595,7 @@ The diagram shows a tensor of shape `(N batch, C channels, H×W spatial)` and sh
   </g>
 </svg>
 
-> **Batch norm: train vs eval (a classic gotcha):** during training, batch norm normalizes using the *current batch's* mean and variance and updates a running average of them. At inference it switches to those frozen running statistics, so an image's output doesn't depend on whatever else happens to be in its batch. Forgetting to call `model.eval()` is a very common bug. This batch dependence is also exactly why batch norm degrades with tiny batches — and why layer norm and group norm exist.
+> **Batch norm: train vs eval:** during training, batch norm normalizes using the *current batch's* mean and variance and updates a running average of them. At inference it switches to those frozen running statistics, so an image's output doesn't depend on whatever else happens to be in its batch. Forgetting to call `model.eval()` is a very common bug. This batch dependence is also exactly why batch norm degrades with tiny batches — and why layer norm and group norm exist.
 
 ---
 
@@ -576,7 +628,7 @@ applied elementwise to the linear output:   output = f(W x + b)
   </g>
 </svg>
 
-A practical note interviewers like: ReLU can **"die."** If a neuron's pre-activation is always negative, ReLU outputs 0 and its gradient is 0, so it never updates again. Too-high learning rates make this worse. LeakyReLU (a small slope for negatives), careful initialization, and batch norm all help keep neurons alive.
+A practical note: ReLU can **"die."** If a neuron's pre-activation is always negative, ReLU outputs 0 and its gradient is 0, so it never updates again. Too-high learning rates make this worse. LeakyReLU (a small slope for negatives), careful initialization, and batch norm all help keep neurons alive.
 
 ---
 
@@ -809,6 +861,51 @@ Tracing the `ARCH` list as 3D volumes makes the whole network legible at a glanc
   </g>
 </svg>
 
+### What do the shrinking feature maps mean?
+
+A natural worry: after all that downsampling, does the `2²×512` volume still represent the image? **Yes — it still represents it, it just stops *looking* like it.** Representation is not resemblance.
+
+As the spatial grid shrinks, each remaining cell's **receptive field** grows, so one cell now summarizes a large patch of the original pixels. And at every cell you don't have a single number but a **512-long vector** — one value per channel — that answers *"which of the 512 learned concepts are present in this region?"*
+
+```text
+8²×512    each cell ≈ a medium patch  →  mid-level concepts (textures, small parts)
+4²×512    each cell ≈ a large patch   →  high-level concepts (ears, eyes, paws)
+2²×512    each cell ≈ a quadrant      →  near-whole-object concepts
+512-vec   one cell = whole image      →  pure "what is it" (no location left)
+```
+
+The network deliberately trades *where exactly* (pixel positions) for *what* (object identity): for "is this a cat?" the precise pixel of a whisker doesn't matter, only that whiskers and ears and fur are present. It's like summarizing an article into a few keywords — not the article, but still a faithful representation of its meaning.
+
+### From the last feature map to the answer: GAP → Linear
+
+The final two steps turn that volume into a prediction.
+
+**1 · Global average pooling** averages each channel's `2×2` grid down to one number (this is `x.mean([2, 3])` in the code), collapsing `512×2×2` into a flat **512-vector** — no parameters, just "how strongly was each feature present on average."
+
+**2 · The Linear layer** is one `y = W x + b`. Each of the 10 outputs is the dot product of one row of `W` with the whole 512-vector, plus a bias:
+
+```text
+x: 512-vec        W: 10 × 512        b: 10-vec        →   y: 10 logits
+yᵢ = bᵢ + Σⱼ Wᵢⱼ · xⱼ       (row i of W = the "template" for class i)
+
+   (10 × 512) · (512 × 1) + (10 × 1) = (10 × 1)
+       W            x          b          y
+weights here: 10 × 512 = 5,120  (+ 10 biases)
+```
+
+A tiny worked version (shrink 512→4, 10→3 so it's hand-checkable):
+
+```text
+x = [1.0, 2.0, 0.5, 3.0]
+row "cat"  = [ 0.2, 0.1, 0.0, 0.5],  b=0.1  →  0.1 + (0.2+0.2+0+1.5) = 2.0
+row "dog"  = [-0.3, 0.4, 0.2, 0.1],  b=0.0  →  0.0 + (-0.3+0.8+0.1+0.3) = 0.9
+row "bird" = [ 0.1,-0.2, 0.6, 0.0],  b=-0.2 →  -0.2 + (0.1-0.4+0.3+0) = -0.2
+
+logits = [2.0, 0.9, -0.2]  → softmax → [0.71, 0.26, 0.08]  → argmax → "cat"
+```
+
+So `2²×512 → GAP → 512-vec → Linear → 10 logits → softmax → label`: the global average pool flattens, and the linear layer scores each class as a weighted vote over the 512 features.
+
 ---
 
 ## Recap
@@ -816,6 +913,8 @@ Tracing the `ARCH` list as 3D volumes makes the whole network legible at a glanc
 - CNNs exist to **replace hand-built feature engineering** with features learned end-to-end from raw pixels in a single model.
 - Every layer is a flavor of `output = features · weight + bias`.
 - **Convolution** extracts features while preserving spatial structure; **pooling** downsamples; **normalization** keeps activations stable; **activation functions** add the non-linearity that makes depth worthwhile; the **fully-connected** layer makes the final call.
+- A conv only shrinks the map by its border (`k−1`) unless you add **padding** — `padding=1` on a 3×3 keeps the size, so in VGG only pooling downsamples.
+- Deep feature maps still **represent** the image without **resembling** it: each cell holds a 512-value "concept vector" over a large receptive field, until the final vector is pure "what is it."
 - A **feature map** is a 3D volume (channels × height × width) — a cluster of cubes, one value per cell.
 - The **receptive field** is the slice of the input that one neuron sees; it grows with depth until deep neurons see the whole image.
 - **Grouped convolution** wires each output to only a slice of the inputs, cutting parameters by a factor of `g`; a **1×1 conv** mixes channels with no spatial extent.
