@@ -766,7 +766,7 @@ That is a complete CNN: raw pixels go into `forward`, and ten numbers — one sc
 
 Tracing the `ARCH` list as 3D volumes makes the whole network legible at a glance. Watch the two trends as data flows left to right: the **spatial size shrinks** every time a `MaxPool2d` halves height and width (32 → 16 → 8 → 4 → 2), while the **channel depth grows** as each conv block learns more features (3 → 64 → 128 → 256 → 512). The network trades *where* for *what*: it gives up spatial resolution to build up an ever-richer description of content. At the end, a global average pool flattens the volume to a 512-vector and the fully-connected layer turns it into 10 class scores.
 
-<svg viewBox="0 0 1000 400" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
+<svg viewBox="0 0 1180 400" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;display:block;margin:1rem 0">
   <defs>
     <marker id="arrE" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M0,0 L10,5 L0,10 z" fill="#1f6feb"/>
@@ -835,7 +835,32 @@ Tracing the `ARCH` list as 3D volumes makes the whole network legible at a glanc
     <g fill="#fff8d8" stroke="#b66f00" stroke-width="1.5">
       <rect x="940" y="150" width="12" height="12"/><rect x="940" y="165" width="12" height="12"/><rect x="940" y="180" width="12" height="12"/><rect x="940" y="195" width="12" height="12"/><rect x="940" y="210" width="12" height="12"/>
     </g>
-    <text x="946" y="283" text-anchor="middle" font-size="10" fill="#555">10 classes</text>
+    <text x="946" y="283" text-anchor="middle" font-size="10" fill="#555">10 logits</text>
+
+    {/* Softmax → probabilities */}
+    <line x1="958" y1="210" x2="998" y2="210" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrE)"/>
+    <text x="1030" y="92" text-anchor="middle" font-size="11" font-weight="800" fill="#0e7490">Softmax</text>
+    <text x="1030" y="106" text-anchor="middle" font-size="9" fill="#0e7490">→ probabilities</text>
+    <g stroke="#0e7490" stroke-width="1">
+      <rect x="1004" y="150" width="64" height="12" fill="#22d3ee"/>
+      <rect x="1004" y="166" width="26" height="12" fill="#a5f3fc"/>
+      <rect x="1004" y="182" width="10" height="12" fill="#a5f3fc"/>
+      <rect x="1004" y="198" width="6" height="12" fill="#a5f3fc"/>
+      <rect x="1004" y="214" width="4" height="12" fill="#a5f3fc"/>
+    </g>
+    <text x="1072" y="160" font-size="8" fill="#555">cat .71</text>
+    <text x="1072" y="176" font-size="8" fill="#555">dog .26</text>
+    <text x="1036" y="283" text-anchor="middle" font-size="10" fill="#555">10 probs (Σ=1)</text>
+
+    {/* argmax → predicted label */}
+    <line x1="1100" y1="210" x2="1124" y2="210" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrE)"/>
+    <text x="1112" y="150" text-anchor="middle" font-size="9" fill="#a85a00">argmax</text>
+    <rect x="1128" y="190" width="40" height="32" rx="5" fill="#fff8d8" stroke="#b66f00" stroke-width="2"/>
+    <text x="1148" y="211" text-anchor="middle" font-size="12" font-weight="800" fill="#a85a00">cat</text>
+
+    {/* note: softmax lives outside the model */}
+    <text x="1040" y="322" text-anchor="middle" font-size="9" fill="#888" font-style="italic">softmax is applied after the network —</text>
+    <text x="1040" y="334" text-anchor="middle" font-size="9" fill="#888" font-style="italic">at inference, or folded into the loss in training</text>
 
     {/* forward arrows */}
     <g stroke="#1f6feb" stroke-width="2">
@@ -905,6 +930,8 @@ logits = [2.0, 0.9, -0.2]  → softmax → [0.71, 0.26, 0.08]  → argmax → "c
 ```
 
 So `2²×512 → GAP → 512-vec → Linear → 10 logits → softmax → label`: the global average pool flattens, and the linear layer scores each class as a weighted vote over the 512 features.
+
+**Where exactly is softmax applied?** It's the very last step — right *after* the final linear layer — turning the 10 logits into probabilities that sum to 1, after which `argmax` picks the winner. One subtlety worth knowing: softmax is **not** inside the VGG `forward()` shown earlier. During **training**, PyTorch's `nn.CrossEntropyLoss` applies (log-)softmax internally for numerical stability, so the model deliberately outputs raw logits. You only call `softmax` yourself at **inference**, when you want human-readable probabilities. Either way it lives at the very end of the pipeline, never between the conv layers.
 
 ---
 
