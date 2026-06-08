@@ -1,0 +1,319 @@
+# Neural Network Pruning Blog Post Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Create a high-quality MDX blog post deep-diving into the concepts, code, and trade-offs of neural network pruning based on MIT 6.5940 Lab 1.
+
+**Architecture:** Add a new MDX article in the Astro content collection under `src/content/blog/` and verify that Astro builds successfully.
+
+**Tech Stack:** Astro, MDX, PyTorch, Markdown, LaTeX
+
+---
+
+### Task 1: Create the MDX Blog Post
+
+**Files:**
+- Create: `src/content/blog/nn-pruning-deep-dive.mdx`
+
+- [x] **Step 1: Write the MDX file with full content**
+
+Create the file `/src/content/blog/nn-pruning-deep-dive.mdx` with the following content:
+
+```mdx
+---
+title: 'Neural network pruning — from fine-grained to channel pruning and everything in between'
+description: 'A lab-driven exploration of neural network pruning: implementing fine-grained and channel pruning, sensitivity analysis, channel sorting, and the hardware trade-offs of sparse vs. structured weights.'
+pubDate: '2026-06-08'
+type: 'experiment'
+tags: ['aiml', 'pytorch', 'performance', 'model-compression']
+---
+
+Deploying state-of-the-art neural networks to embedded or mobile edge devices is a constant battle against physical constraints. A standard VGG network trained on the CIFAR-10 dataset has a baseline accuracy of **92.95%**, but it requires **35.20 MiB** of storage and billions of Multiply-Accumulate (MAC) operations. On a resource-constrained microcontroller or mobile processor, this footprint is prohibitive.
+
+To make these models viable on the edge, we turn to **neural network pruning**—the process of systematically removing parameters from the network while striving to preserve accuracy.
+
+This post is a deep dive into two distinct pruning paradigms: **Fine-Grained (Unstructured) Pruning** and **Channel (Structured) Pruning**. We will walk through their PyTorch implementations, explore layer sensitivity profiles, and discuss the hardware trade-offs that dictate which method is best for real-world deployment.
+
+---
+
+## Why Can We Prune? Weight Distribution Analysis
+
+Before writing any pruning code, we need to understand *why* neural networks can lose a huge portion of their parameters and still function. The answer lies in the distribution of weight values.
+
+If we look at the weight histograms of a trained VGG model, we find that the weights in almost all layers exhibit a zero-centered, bell-shaped (Gaussian-like) distribution.
+
+<figure style="margin:1.25rem 0">
+  <div style="background:#1e293b;padding:1rem;border-radius:6px;color:#fff;font-family:monospace;font-size:0.85em">
+    {`Weight distribution in trained VGG layers:
+    - Many weights have values very close to zero.
+    - Only a small percentage of weights have large positive or negative magnitudes.`}
+  </div>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">Weight values form a dense Gaussian curve centered at 0.</figcaption>
+</figure>
+
+### How this distribution helps pruning:
+Because the majority of weights cluster tightly around zero, their absolute magnitudes are very small. In a neural network, a weight of $0.01$ contributes almost nothing to the activation of the next layer compared to a weight of $0.8$. Setting these near-zero weights to exactly zero—introducing sparsity—allows us to eliminate them without significantly changing the model's output or dropping its accuracy.
+
+---
+
+## Part 1: Fine-Grained (Unstructured) Pruning
+
+Fine-grained pruning operates on individual weights. We set a target sparsity (e.g., 60%), find the threshold magnitude below which weights should be discarded, and create a binary mask.
+
+### 1. The PyTorch Implementation
+
+Here is the magnitude-based fine-grained pruning implementation:
+
+```python
+def fine_grained_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
+    """
+    Quantize tensor using fine-grained pruning.
+    :param tensor: PyTorch tensor to be pruned.
+    :param sparsity: Target sparsity ratio (between 0.0 and 1.0).
+    :return: Binary mask indicating non-zero elements.
+    """
+    sparsity = min(max(0.0, sparsity), 1.0)
+    if sparsity == 1.0:
+        tensor.zero_()
+        return torch.zeros_like(tensor)
+    elif sparsity == 0.0:
+        return torch.ones_like(tensor)
+
+    num_elements = tensor.numel()
+
+    # Step 1: Calculate the number of zeros to introduce
+    num_zeros = round(sparsity * num_elements)
+    
+    # Step 2: Calculate the importance of weight (absolute magnitude)
+    importance = torch.abs(tensor)
+    
+    # Step 3: Find the pruning threshold using the kth value
+    threshold = importance.flatten().kthvalue(num_zeros)[0]
+    
+    # Step 4: Get binary mask (1 for nonzeros, 0 for zeros)
+    mask = (importance > threshold).float()
+    
+    # Step 5: Apply mask to prune the tensor in-place
+    tensor.mul_(mask)
+
+    return mask
+```
+
+By applying this function, weights below the threshold magnitude are zeroed out, resulting in a sparse tensor.
+
+### 2. Layer Sensitivity Analysis
+
+Not all layers in a neural network are created equal. If we prune every layer to the same sparsity, accuracy drops quickly. To prune effectively, we must generate **sensitivity curves** by pruning one layer at a time to varying sparsities and recording the resulting accuracy.
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700;width:30%">Layer Type</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Sensitivity Level</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Why?</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">First Layer (conv0)</td>
+      <td style="padding:9px 14px;color:#ef4444;font-weight:700">Extremely High</td>
+      <td style="padding:9px 14px">It processes raw pixels and extracts low-level features (edges, textures). Since it has only 3 input channels, there is zero redundancy; pruning it destroys basic vision details.</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Intermediate Convs</td>
+      <td style="padding:9px 14px;color:#f97316;font-weight:700">Moderate</td>
+      <td style="padding:9px 14px">Mid-level layers have more channels and exhibit moderate redundancy, letting us prune them up to 40-50% before accuracy begins to degrade.</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Final Classifier</td>
+      <td style="padding:9px 14px;color:#22c55e;font-weight:700">Low (Very Robust)</td>
+      <td style="padding:9px 14px">The final linear layer contains the bulk of the network parameters (redundancy is very high) and maps abstract concepts. We can prune it to 90% sparsity with virtually no accuracy loss.</td>
+    </tr>
+  </tbody>
+</table>
+
+### 3. Layer-by-Layer Sparsity Allocation
+
+Based on sensitivity curves and parameter distributions, we formulate a non-uniform layer-by-layer sparsity plan to maximize compression:
+
+```python
+sparsity_dict = {
+    'backbone.conv0.weight': 0.4,  # Sensitive first layer: prune conservatively
+    'backbone.conv1.weight': 0.7,  # Larger, less sensitive
+    'backbone.conv2.weight': 0.5,
+    'backbone.conv3.weight': 0.4,
+    'backbone.conv4.weight': 0.4,
+    'backbone.conv5.weight': 0.4,
+    'backbone.conv6.weight': 0.4,
+    'backbone.conv7.weight': 0.8,  # High redundancy in deep layer
+    'classifier.weight': 0.9       # Classifier has the most parameters: prune aggressively
+}
+```
+
+This strategy achieves a **75% model size reduction** (from 35.20 MiB down to **8.8 MiB**) while keeping the post-finetuning accuracy drop below **0.5%**.
+
+---
+
+## Part 2: Channel (Structured) Pruning
+
+While fine-grained pruning is elegant, it has a fatal flaw: standard CPUs and GPUs cannot easily accelerate sparse matrix multiplication. To achieve real speedups without custom hardware, we use **Channel Pruning** to physically shrink the dimensions of the tensors.
+
+```
+Fine-Grained Pruning (Unstructured):
+[ W  0  W  0 ]  <- Keeps shape, introduces zeroes.
+[ 0  W  0  W ]     Requires sparse computing support.
+
+Channel Pruning (Structured):
+[ W  W  W ]     <- Physically deletes channels (filters).
+[ W  W  W ]        Produces a smaller, dense matrix.
+```
+
+### 1. Dimension Alignment in PyTorch
+
+When we prune an output channel of a convolutional layer, we must also prune:
+1. The corresponding scale, bias, and running statistics of its associated BatchNorm layer.
+2. The matching input channels of the *succeeding* convolutional layer.
+
+Here is the structured channel pruning implementation:
+
+```python
+def get_num_channels_to_keep(channels: int, prune_ratio: float) -> int:
+    return int(round(channels * (1. - prune_ratio)))
+
+@torch.no_grad()
+def channel_prune(model: nn.Module, prune_ratio: float) -> nn.Module:
+    model = copy.deepcopy(model)
+    all_convs = [m for m in model.backbone if isinstance(m, nn.Conv2d)]
+    all_bns = [m for m in model.backbone if isinstance(m, nn.BatchNorm2d)]
+    
+    for i_ratio, p_ratio in enumerate(prune_ratio):
+        prev_conv = all_convs[i_ratio]
+        prev_bn = all_bns[i_ratio]
+        next_conv = all_convs[i_ratio + 1]
+        
+        original_channels = prev_conv.out_channels
+        n_keep = get_num_channels_to_keep(original_channels, p_ratio)
+
+        # Prune the output of the previous conv and bn
+        prev_conv.weight.set_(prev_conv.weight.detach()[:n_keep])
+        prev_bn.weight.set_(prev_bn.weight.detach()[:n_keep])
+        prev_bn.bias.set_(prev_bn.bias.detach()[:n_keep])
+        prev_bn.running_mean.set_(prev_bn.running_mean.detach()[:n_keep])
+        prev_bn.running_var.set_(prev_bn.running_var.detach()[:n_keep])
+
+        # Prune the input of the next conv to align dimensions
+        next_conv.weight.set_(next_conv.weight.detach()[:, :n_keep])
+
+    return model
+```
+
+### 2. Structured Selection: Channel Sorting by Importance
+
+Naively keeping the first $K$ channels is suboptimal. We want to keep the channels that contain the most information. We compute the importance of each input channel based on the $L_2$ norm of its weights, sort the channels, and keep the top ones:
+
+```python
+def get_input_channel_importance(weight: torch.Tensor) -> torch.Tensor:
+    importances = []
+    # Compute the L2 norm for each input channel
+    for i_c in range(weight.shape[1]):
+        channel_weight = weight.detach()[:, i_c]
+        importance = torch.norm(channel_weight)  # L2 norm
+        importances.append(importance.view(1))
+    return torch.cat(importances)
+
+@torch.no_grad()
+def apply_channel_sorting(model: nn.Module) -> nn.Module:
+    model = copy.deepcopy(model)
+    all_convs = [m for m in model.backbone if isinstance(m, nn.Conv2d)]
+    all_bns = [m for m in model.backbone if isinstance(m, nn.BatchNorm2d)]
+    
+    for i_conv in range(len(all_convs) - 1):
+        prev_conv = all_convs[i_conv]
+        prev_bn = all_bns[i_conv]
+        next_conv = all_convs[i_conv + 1]
+        
+        # Sort channels based on input channel importance in the next layer
+        importance = get_input_channel_importance(next_conv.weight)
+        sort_idx = torch.argsort(importance, descending=True)
+
+        # Apply sorted index to previous conv and bn
+        prev_conv.weight.copy_(torch.index_select(prev_conv.weight.detach(), 0, sort_idx))
+        for tensor_name in ['weight', 'bias', 'running_mean', 'running_var']:
+            tensor_to_apply = getattr(prev_bn, tensor_name)
+            tensor_to_apply.copy_(torch.index_select(tensor_to_apply.detach(), 0, sort_idx))
+
+        # Apply sorted index to next conv input weights
+        next_conv.weight.copy_(torch.index_select(next_conv.weight.detach(), 1, sort_idx))
+
+    return model
+```
+
+Sorting ensures that the channels with the largest weight magnitudes are grouped at the beginning, allowing us to drop the less important ones from the end.
+
+### 3. Performance Analysis: MACs vs. Latency Speedup
+
+If we apply a uniform 30% channel pruning ratio, we notice that MACs (Multiply-Accumulate operations) drop from **363M to 305M**, and the model gets noticeably faster.
+
+However, **pruning 30% of the channels does not result in a 30% wall-clock latency speedup.** Why?
+1. **Memory Bandwidth Bottleneck:** Speed is not just determined by arithmetic operations (computation bounds); loading parameters from memory into registers (memory bounds) takes significant time.
+2. **Parallel GPU Architecture:** GPUs run processes in parallel warps (e.g., 32 threads). If channel count is reduced but still occupies the same number of computing warps, the physical compute latency may not change linearly.
+3. **Fixed Overheads:** Kernel launch times and data copying remain constant.
+
+In contrast, pruning a massive **70% of the channels** yields a dramatic, non-linear speedup on standard CPUs/GPUs because it reduces tensor dimensions past parallelization thresholds—but the model capacity drops so severely that accuracy collapses.
+
+---
+
+## Part 3: The Grand Trade-Off: Unstructured vs. Structured
+
+When designing an EfficientML pipeline, choosing between fine-grained (unstructured) and channel (structured) pruning comes down to the following trade-offs:
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Metric</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Fine-Grained Pruning</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Channel Pruning</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Accuracy at High Sparsity</td>
+      <td style="padding:9px 14px;background:#f0fdf4;color:#15803d;font-weight:700">High (Robust)</td>
+      <td style="padding:9px 14px;background:#fef2f2;color:#b91c1c;font-weight:700">Low (Sensitive)</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Hardware Acceleration</td>
+      <td style="padding:9px 14px;background:#fef2f2;color:#b91c1c;font-weight:700">Requires Sparse Hardware</td>
+      <td style="padding:9px 14px;background:#f0fdf4;color:#15803d;font-weight:700">Native (CPUs, GPUs, TPUs)</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Real Latency Speedup</td>
+      <td style="padding:9px 14px;background:#fef2f2;color:#b91c1c;font-weight:700">Zero on standard libraries</td>
+      <td style="padding:9px 14px;background:#f0fdf4;color:#15803d;font-weight:700">Immediate and Linear</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Memory Storage Overhead</td>
+      <td style="padding:9px 14px">Requires metadata (CSR indices/masks)</td>
+      <td style="padding:9px 14px;background:#f0fdf4;color:#15803d;font-weight:700">Zero (Native dense shape)</td>
+    </tr>
+  </tbody>
+</table>
+
+### Key Takeaway
+* Use **Fine-Grained Pruning** if you are targeting specialized edge AI accelerators (like NVIDIA Tensor Cores with $2:4$ sparsity support) and cannot tolerate any accuracy loss.
+* Use **Channel Pruning** if you need immediate, out-of-the-box latency speedup on standard CPUs, GPUs, or browser-based ONNX runtimes, and have enough training budget to recover lost accuracy through fine-tuning.
+```
+
+---
+
+### Task 2: Validate the Astro Build
+
+**Files:**
+- Modify: none (verification command)
+
+- [x] **Step 1: Run the build to verify formatting**
+
+Run the build script in the terminal to verify the MDX compiles correctly with no syntax or markdown layout errors:
+
+Run: `npm run build`
+Expected: Static build completes successfully without errors, producing `dist/` directory.
