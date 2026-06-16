@@ -1,0 +1,452 @@
+---
+title: 'Neural network quantization — from k-means codebooks to integer-only inference'
+description: 'A lab-driven exploration of neural network quantization: k-means codebooks, linear (affine) quantization with scale and zero-point, integer-only inference, and the PTQ-vs-QAT trade-offs that decide how much accuracy survives on the edge.'
+pubDate: '2026-06-16'
+type: 'experiment'
+tags: ['aiml', 'pytorch', 'performance', 'model-compression']
+---
+
+Deploying a state-of-the-art neural network to a phone or microcontroller means fighting for every megabyte and every millijoule. Our baseline VGG network, trained on CIFAR-10, reaches **92.95%** accuracy — but it stores all **9.2 million** weights as 32-bit floats, for a footprint of **35.20 MiB**. On the edge, that's often too big to ship.
+
+**Quantization** attacks this directly: instead of storing each weight in 32 bits, we represent it with far fewer — 8 bits, 4 bits, sometimes 2 — shrinking the model 4×, 8×, or more, and (on the right hardware) speeding up inference by replacing floating-point math with integer math.
+
+This post is a lab-driven deep dive into two quantization families — **K-Means (codebook) Quantization** and **Linear (affine) Quantization** — and the cross-cutting choice that governs how much accuracy you keep: **post-training quantization (PTQ) vs. quantization-aware training (QAT)**.
+
+---
+
+## Why can we get away with it?
+
+The same reason pruning works: **trained weights carry far less information than 32 bits implies.**
+
+### FP32 is a galaxy-sized ruler
+
+An FP32 number spends its bits on a huge dynamic range — it can represent magnitudes from about 10⁻³⁸ to 10³⁸ — plus roughly 7 digits of precision. But if you drop all 9.2M trained weights onto a number line, they don't spread out. They pile into a narrow, zero-centered bell, almost all within −0.5…0.5.
+
+<figure style="margin:1.25rem 0">
+  <img src="/quantization/weight-distribution.png" alt="Histograms of VGG layer weights, all narrow bells centered at zero" style="max-width:100%;border-radius:6px;border:1px solid #334155"/>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">Every layer's weights form a narrow, zero-centered bell — almost all within a band like −0.5…0.5, a tiny sliver of FP32's representable range.</figcaption>
+</figure>
+
+> It's like owning a ruler that measures from the width of an atom to the distance to the Moon, then only ever using it to measure **coins**. The instrument works — but nearly all of its range is wasted. FP32 is that ruler; the weights are the coins.
+
+So we stop describing weights in absolute, galaxy-scale units. We pick the smallest step we care about — one shared `scale` for the tensor — and just record **how many steps from zero** each weight is. Each weight becomes a small integer, and the wasted range is gone.
+
+### Why losing precision barely hurts
+
+With 8 bits we keep 256 distinct levels across the weight band, so each weight is snapped to its nearest level — off by at most half a tiny step. Two things then make that error nearly free:
+
+1. **The decision is an argmax over 10 classes.** When the network is confident, small wiggles in the output don't change *which* class is largest.
+2. **The errors cancel.** A neuron sums hundreds of `weight × input` terms. The rounding errors are random and roughly zero-mean, so across the sum they largely cancel — the signal grows like *N*, but the noise only like √N.
+
+> **The one idea to remember:** quantization adds a small, zero-mean noise to each weight, and a wide network *averages that noise away* — right up until the noise gets too big to average away.
+
+That threshold is exactly what the numbers show:
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Bit-width</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Distinct levels</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Accuracy</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">32 (FP32 baseline)</td>
+      <td style="padding:9px 14px">—</td>
+      <td style="padding:9px 14px;font-weight:600">92.95%</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">8-bit</td>
+      <td style="padding:9px 14px">256</td>
+      <td style="padding:9px 14px;color:#15803d;font-weight:700">92.76%</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">4-bit</td>
+      <td style="padding:9px 14px">16</td>
+      <td style="padding:9px 14px;color:#f97316;font-weight:700">79.07%</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">2-bit</td>
+      <td style="padding:9px 14px">4</td>
+      <td style="padding:9px 14px;color:#b91c1c;font-weight:700">10.00%</td>
+    </tr>
+  </tbody>
+</table>
+
+256 levels keeps the per-weight error small enough to average away. Sixteen levels starts to pinch. Four levels blows past the threshold — the dot products turn to noise and the model degrades to random guessing. Everything else in this post is about pushing the bit-width down while clawing that accuracy back.
+
+*(These are k-means quantization results, measured in the lab; the same intuition carries over to linear quantization in Part 2.)*
+
+---
+
+## PTQ vs. QAT: the choice that runs through everything
+
+Every quantization method has to answer one question: *do we let training see the quantization, or not?* That single fork defines the two regimes you'll see throughout this post.
+
+**Post-training quantization (PTQ)** takes an already-trained model and quantizes it **once, afterward**. It may run a handful of batches through the network to *calibrate* — measuring activation ranges so it can choose a good `scale` and `zero_point` — but that's measurement, not learning. The model never experienced quantization during training. It's cheap (seconds to minutes), needs no labels, and is the first thing you should try.
+
+**Quantization-aware training (QAT)** simulates quantization *inside* the training forward pass. A "fake-quantize" node rounds the weights (and activations) on every forward step, so the loss is computed on quantized values and the gradients push the weights toward positions where that error does the least damage. It costs a real training run, but it recovers accuracy that PTQ leaves on the floor.
+
+The dividing line is **not** "did backprop happen?" — it's *was quantization present in the forward pass while you trained?* Fine-tune a full-precision model and quantize it afterward, and that's still PTQ no matter how much backprop you did. Fine-tune with the weights kept quantized every forward step, and that's QAT. Same optimizer, same gradients — what flips the label is whether the rounding was *in* the loop.
+
+<figure style="margin:1.5rem 0">
+  <svg viewBox="0 0 760 344" role="img" aria-label="Flow diagram comparing PTQ and QAT" style="max-width:100%;height:auto;background:#0f172a;border-radius:8px;border:1px solid #334155;font-family:ui-sans-serif,system-ui,sans-serif">
+    <defs>
+      <marker id="qarrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#94a3b8"/></marker>
+      <marker id="qarrowO" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#f97316"/></marker>
+    </defs>
+
+    <text x="14" y="28" fill="#22c55e" font-size="14" font-weight="700">PTQ — quantize once, no retraining</text>
+    <rect x="14"  y="46" width="152" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="90" y="72">Trained</tspan><tspan x="90" y="90">FP32 model</tspan></text>
+    <rect x="202" y="46" width="152" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="278" y="72">Calibrate</tspan><tspan x="278" y="90">(measure ranges)</tspan></text>
+    <rect x="390" y="46" width="152" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="466" y="72">Quantize once</tspan><tspan x="466" y="90">(pick S, Z)</tspan></text>
+    <rect x="578" y="46" width="152" height="60" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="1.8"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="654" y="72">INT model</tspan><tspan x="654" y="90">→ deploy</tspan></text>
+    <line x1="166" y1="76" x2="200" y2="76" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
+    <line x1="354" y1="76" x2="388" y2="76" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
+    <line x1="542" y1="76" x2="576" y2="76" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
+
+    <text x="14" y="156" fill="#f97316" font-size="14" font-weight="700">QAT — train through quantization (STE)</text>
+    <text x="500" y="170" text-anchor="middle" fill="#f97316" font-size="10.5">repeat each step / epoch</text>
+    <path d="M580 192 C 580 172, 420 172, 420 192" fill="none" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#qarrowO)"/>
+    <rect x="14"  y="196" width="152" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="90" y="222">Trained</tspan><tspan x="90" y="240">FP32 model</tspan></text>
+    <rect x="202" y="196" width="152" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="278" y="222">Insert</tspan><tspan x="278" y="240">fake-quant nodes</tspan></text>
+    <rect x="390" y="192" width="214" height="132" rx="8" fill="#1e293b" stroke="#f97316" stroke-width="1.5"/>
+    <text x="404" y="216" fill="#f97316" font-size="11.5" font-weight="700">Training loop (per step):</text>
+    <text x="404" y="242" fill="#e2e8f0" font-size="11">1. forward on quantized W</text>
+    <text x="404" y="266" fill="#e2e8f0" font-size="11">2. compute loss</text>
+    <text x="404" y="290" fill="#e2e8f0" font-size="11">3. backward via STE</text>
+    <text x="404" y="314" fill="#e2e8f0" font-size="11">4. update FP32 shadow W</text>
+    <rect x="638" y="196" width="108" height="60" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="1.8"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="692" y="222">Quantize</tspan><tspan x="692" y="240">→ deploy</tspan></text>
+    <line x1="166" y1="226" x2="200" y2="226" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
+    <line x1="354" y1="226" x2="388" y2="226" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
+    <line x1="604" y1="226" x2="636" y2="226" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
+  </svg>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">PTQ is a single forward pass to set quantization parameters. QAT puts quantization <em>inside</em> a training loop: the forward pass runs on quantized weights, and STE lets gradients flow back to full-precision shadow weights that the loop keeps refining.</figcaption>
+</figure>
+
+### How do you choose? Set an accuracy budget.
+
+Try PTQ first; escalate to QAT only if the accuracy drop exceeds what you can tolerate. The lab makes this literal with a **0.5% drop threshold**:
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Bit-width</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Accuracy after PTQ</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Drop</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Verdict</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">8-bit</td>
+      <td style="padding:9px 14px">92.76%</td>
+      <td style="padding:9px 14px;color:#15803d;font-weight:700">0.19%</td>
+      <td style="padding:9px 14px">Under budget → <strong>PTQ is enough</strong></td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">4-bit</td>
+      <td style="padding:9px 14px">79.07%</td>
+      <td style="padding:9px 14px;color:#f97316;font-weight:700">13.88%</td>
+      <td style="padding:9px 14px">Over budget → <strong>QAT</strong> → 92.55%</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">2-bit</td>
+      <td style="padding:9px 14px">10.00%</td>
+      <td style="padding:9px 14px;color:#b91c1c;font-weight:700">82.95%</td>
+      <td style="padding:9px 14px">Over budget → <strong>QAT</strong> → 91.25%</td>
+    </tr>
+  </tbody>
+</table>
+
+### The trick that makes QAT possible: the Straight-Through Estimator
+
+There's a problem hiding in QAT: rounding is a step function, so its gradient is zero almost everywhere (and undefined at the steps). Backprop through it would zero out every gradient, and the model could never learn. The fix is the **Straight-Through Estimator (STE)**:
+
+> Round in the forward pass so the network feels the quantization error — but on the backward pass, pretend the rounding was the identity function and let the gradient pass *straight through* it. Those gradients update a full-precision "shadow" copy of the weights, which is re-quantized on the next step.
+
+So QAT always keeps the real, continuous weights around: quantization happens on the forward pass, and learning happens in full precision. In the k-means variant we'll see in Part 1, the same idea appears as centroids that are recomputed as the **mean of the weights** assigned to each cluster — the codebook chases the weights as they move.
+
+### The two regimes, in code
+
+Let's make the fork concrete on **linear int8** — the regime production toolchains (TFLite, TensorRT, ONNX Runtime) are built around, and the one you'll reach for first in practice.
+
+**PTQ never trains.** It runs a few batches to *calibrate* — observe the value ranges — picks a `scale` and `zero_point`, and quantizes once:
+
+```python
+model = trained_fp32_model                           # 92.95%
+
+# 1. Calibrate: observe weight/activation ranges over a few batches (measurement, not learning)
+ranges = collect_ranges(model, calib_loader)
+
+# 2. Pick S and Z from those ranges, then quantize the weights once
+for layer in model.quantizable_layers():
+    S, Z = choose_scale_zero_point(ranges[layer], bitwidth=8)
+    layer.weight_int = linear_quantize(layer.weight, bitwidth=8, scale=S, zero_point=Z)
+
+accuracy = evaluate(quantized_model, test_loader)    # 92.87% — no gradients, no training
+```
+
+**QAT simulates that int8 rounding *inside* the forward pass**, so the loss feels it and the gradients can compensate. A "fake-quantize" op rounds-then-dequantizes, and the STE makes its backward an identity:
+
+```python
+# Illustrative: the lab implements QAT only for k-means. Linear QAT uses this same
+# fake-quant + STE recipe — which production toolchains (torch.ao.quantization, etc.) automate.
+
+def fake_quantize(w, S, Z, q_min, q_max):
+    q     = torch.clamp(torch.round(w / S) + Z, q_min, q_max)
+    w_hat = (q - Z) * S                       # quantize → dequantize: snapped to the int8 grid, still float
+    return w + (w_hat - w).detach()           # STE: forward = w_hat, backward = identity
+
+# ── THIS is "using QAT": a layer that fake-quantizes its weight inside forward() ──
+class QATLinear(nn.Linear):                   # (a QATConv2d looks the same)
+    def forward(self, x):
+        w_fq = fake_quantize(self.weight, self.S, self.Z, self.q_min, self.q_max)  # ← rounding enters the forward
+        return F.linear(x, w_fq, self.bias)   # the matmul runs on the fake-quantized weight
+
+# QAT is fine-tuning, not training from scratch: start from the SAME trained FP32 checkpoint PTQ used.
+model = trained_fp32_model                    # the 92.95% model from ordinary FP32 training
+attach_fake_quant(model)                      # swap each nn.Linear / nn.Conv2d → its QAT* version above
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)  # low LR — fine-tuning
+
+for epoch in range(num_finetune_epochs):      # a handful of epochs, not dozens
+    for inputs, targets in train_loader:
+        optimizer.zero_grad()
+        outputs = model(inputs)               # every QAT layer calls fake_quantize() here — loss sees the rounding
+        loss = criterion(outputs, targets)
+        loss.backward()                       # STE routes the gradient to the FP32 weights
+        optimizer.step()                      # update the full-precision shadow weights
+
+# ── Convert: NOW the model actually becomes integer (this is the only step that shrinks it) ──
+for layer in model.quantizable_layers():
+    layer.weight_int = linear_quantize(layer.weight, bitwidth=8,   # real int storage, not float w_hat
+                                       scale=layer.S, zero_point=layer.Z)
+    del layer.weight                          # drop the FP32 weight; keep weight_int + S + Z
+```
+
+Note the bit-width lives in the `fake_quantize` range during training and in this `linear_quantize` call at convert — set both to 4 and you get an int4 model instead. Everything up to the convert line keeps the weights in **FP32**; `fake_quantize` only *simulates* the rounding (quantize → dequantize back to float). The model physically shrinks to integers only at that last loop.
+
+The "use" of QAT is `QATLinear.forward` calling `fake_quantize()` on its weight before the matmul — that single line is what puts rounding *inside* the forward pass. `attach_fake_quant` just swaps every `nn.Linear` / `nn.Conv2d` for its `QAT*` version, so when `model(inputs)` runs, every layer rounds its weights on the fly. The original FP32 weights are never overwritten (`self.weight` stays full-precision); only the *value used in the matmul* is rounded, while `optimizer.step()` keeps refining `self.weight` underneath. After fine-tuning you run the real, non-fake quantization once and deploy.
+
+The one line that makes it work is `w + (w_hat - w).detach()`. The forward value is the rounded `w_hat`, but `.detach()` hides the rounding from autograd, so `∂(output)/∂w = 1` and the gradient passes **straight through** to the full-precision `w` — the STE, in a single expression. PTQ is the same picture with the training loop deleted: calibrate, quantize once, deploy.
+
+---
+
+## Part 1: K-Means Quantization
+
+K-means quantization asks: across this whole tensor, what are the 2ⁿ values that best summarize all the weights? It runs **k-means clustering** on the weights, finds those 2ⁿ cluster centers (**centroids**), and replaces every weight with the centroid of its cluster.
+
+The result is stored as a **codebook** — a lookup table, not a formula:
+
+```
+weights:    [ 0.21, -0.34,  0.19, -0.31,  0.02, ... ]
+                 │  k-means clustering into 2ⁿ groups
+                 ▼
+labels:     [   2,    0,     2,    0,     1,   ... ]   ← n-bit index, stored per weight
+centroids:  { 0: -0.32,  1: 0.01,  2: 0.20,  3: ... } ← the codebook, stored once
+                 │  decode:  quantized = centroids[labels]
+                 ▼
+quantized:  [ 0.20, -0.32,  0.20, -0.32,  0.01, ... ]
+```
+
+The centroid *is* the quantized value; the label is just an index into the table — there is no scale factor or arithmetic, only a lookup.
+
+<figure style="margin:1.25rem 0">
+  <img src="/quantization/kmeans-codebook.png" alt="A 5x5 tensor of float weights and its 2-bit k-means version using only four distinct colored values" style="max-width:100%;border-radius:6px;border:1px solid #334155"/>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">2-bit k-means on a sample tensor: 25 distinct floats collapse to 2² = 4 centroids (4 colors). Each weight is replaced by its cluster's centroid; only a 2-bit label per weight is stored.</figcaption>
+</figure>
+
+### The implementation
+
+```python
+from collections import namedtuple
+Codebook = namedtuple('Codebook', ['centroids', 'labels'])
+
+def k_means_quantize(fp32_tensor, bitwidth=4, codebook=None):
+    if codebook is None:
+        # n-bit quantization → 2^n clusters
+        n_clusters = 2 ** bitwidth
+        kmeans = KMeans(n_clusters=n_clusters, mode='euclidean')
+        labels = kmeans.fit_predict(fp32_tensor.view(-1, 1))
+        centroids = kmeans.centroids.view(-1)
+        codebook = Codebook(centroids, labels)
+    # decode: replace each weight with its cluster's centroid
+    quantized_tensor = codebook.centroids[codebook.labels]
+    fp32_tensor.set_(quantized_tensor.view_as(fp32_tensor))
+    return codebook
+```
+
+The number of clusters is `2 ** bitwidth` — so 4-bit quantization produces exactly **16** distinct values (and 2ⁿ in general). Everything else is one line of decoding: index the centroid table with the labels.
+
+### What it costs to store
+
+The saving is purely the per-weight index width. Each weight becomes an *n*-bit label instead of a 32-bit float; the codebook itself (2ⁿ floats) is negligible. So the compression ratio is just 32/*n*:
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Bit-width</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Size</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Compression</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Accuracy (PTQ)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0"><td style="padding:9px 14px;font-weight:600">FP32</td><td style="padding:9px 14px">35.20 MiB</td><td style="padding:9px 14px">1×</td><td style="padding:9px 14px;font-weight:600">92.95%</td></tr>
+    <tr style="border-bottom:1px solid #e2e8f0"><td style="padding:9px 14px;font-weight:600">8-bit</td><td style="padding:9px 14px">8.80 MiB</td><td style="padding:9px 14px">4×</td><td style="padding:9px 14px;color:#15803d;font-weight:700">92.76%</td></tr>
+    <tr style="border-bottom:1px solid #e2e8f0"><td style="padding:9px 14px;font-weight:600">4-bit</td><td style="padding:9px 14px">4.40 MiB</td><td style="padding:9px 14px">8×</td><td style="padding:9px 14px;color:#f97316;font-weight:700">79.07%</td></tr>
+    <tr style="border-bottom:1px solid #e2e8f0"><td style="padding:9px 14px;font-weight:600">2-bit</td><td style="padding:9px 14px">2.20 MiB</td><td style="padding:9px 14px">16×</td><td style="padding:9px 14px;color:#b91c1c;font-weight:700">10.00%</td></tr>
+  </tbody>
+</table>
+
+### Recovering accuracy: k-means QAT
+
+8-bit is fine straight out of PTQ (−0.19%). But 4-bit and 2-bit need **quantization-aware training**. The k-means flavor of QAT alternates two steps each epoch:
+
+1. **Forward on quantized weights** — the network runs on the centroid values, so the loss feels the quantization error; STE passes gradients through to the full-precision weights.
+2. **Update the codebook** — recompute each centroid as the mean of the (now-updated) weights assigned to it:
+
+```python
+def update_codebook(fp32_tensor, codebook):
+    n_clusters = codebook.centroids.numel()
+    for k in range(n_clusters):
+        codebook.centroids[k] = fp32_tensor[codebook.labels == k].mean()
+```
+
+The mean is not arbitrary: for a fixed cluster assignment, the mean is the value that minimizes the squared quantization error Σ(wᵢ − c)². So each update provably tightens the codebook around the weights. The recovery is dramatic:
+
+- **4-bit:** 79.07% → **92.55%** (one epoch was enough to get under the 0.5% budget).
+- **2-bit:** 10.00% → **91.25%** after 5 epochs — from random guessing back to a usable model, with only **4 distinct weight values**.
+
+---
+
+## Part 2: Linear Quantization
+
+K-means compresses storage but still computes in floating point. **Linear quantization** is built to do the opposite: run the actual arithmetic in integers. It maps real values to integers with a simple affine rule:
+
+```
+r = S · (q − Z)            (dequantize)
+q = round(r / S) + Z       (quantize, then clamp to [q_min, q_max])
+```
+
+- **`S` (scale)** — a float: the real-world size of one integer step.
+- **`Z` (zero-point)** — an integer: the code that represents real `0.0` exactly.
+
+`Z` exists so zero is represented without error, and so an **asymmetric** range (like an all-positive ReLU output) can use the full integer span instead of wasting half of it on values that never occur. When the range is symmetric, `Z = 0`.
+
+<figure style="margin:1.25rem 0">
+  <img src="/quantization/linear-quantize.png" alt="A float tensor mapped to small signed integers and reconstructed back to evenly-spaced float values" style="max-width:100%;border-radius:6px;border:1px solid #334155"/>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">2-bit linear quantization: floats map to evenly-spaced integer codes (left → middle), and dequantizing reconstructs them onto a uniform grid (right). Unlike k-means, the levels are equally spaced — which is exactly what lets the scale factor out of the matmul.</figcaption>
+</figure>
+
+### Choosing the parameters
+
+From the tensor's observed float range and the target integer range:
+
+```python
+scale = (fp_max - fp_min) / (quantized_max - quantized_min)
+zero_point = round(quantized_min - fp_min / scale)
+zero_point = max(quantized_min, min(quantized_max, zero_point))  # clamp
+```
+
+```python
+def linear_quantize(fp_tensor, bitwidth, scale, zero_point, dtype=torch.int8):
+    # q = round(r / S) + Z, clamped to the integer range
+    scaled  = fp_tensor / scale
+    rounded = torch.round(scaled)
+    shifted = rounded + zero_point
+    q_min, q_max = get_quantized_range(bitwidth)
+    return shifted.clamp(q_min, q_max).to(dtype)
+```
+
+### Integer-only inference: the factoring trick
+
+The payoff is that a whole layer can run in integer arithmetic. A linear/conv layer accumulates `Σ rᵥᵥ·rₓ`; substitute the affine form and the scales fall out of the sum:
+
+```
+Σ rᵥᵥ·rₓ = Sᵥᵥ·Sₓ · Σ (qᵥᵥ − Zᵥᵥ)(qₓ − Zₓ)
+                      └── integer multiply-accumulate ──┘
+```
+
+The inner dot product is pure integers; the float scale `Sᵥᵥ·Sₓ` is applied **once** to the accumulated result. To hand an integer tensor to the next layer, we rescale and re-offset:
+
+```
+q_out = round( (Sᵥᵥ·Sₓ / S_out) · accumulator ) + Z_out
+```
+
+**The bias rides along for free.** Since the accumulator already lives at scale `Sᵥᵥ·Sₓ`, the bias is quantized at exactly that scale — no separate zero-point needed:
+
+```python
+bias_scale = input_scale * weight_scale
+```
+
+### Two fusions that make it clean
+
+**Conv-BN fusion.** BatchNorm at inference is just an affine rescale of each channel, so we fold it into the preceding conv's weights and bias *before* quantizing. This leaves a plain conv to quantize and avoids quantizing BN's statistics separately. The fused floating-point model still scores **92.95%** — fusion is exact.
+
+**ReLU fusion.** We don't need a separate ReLU op. Because quantized output is already **clamped** to `[q_min, q_max]`, and a ReLU's output range starts at 0, choosing the output quantization range to start at zero makes the clamp *perform* the ReLU. The non-linearity comes for free from the rounding-and-clamping we were doing anyway.
+
+### The result
+
+Putting it together — per-output-channel weight scales, integer accumulation, folded BN and ReLU — the fully integer **int8** model scores **92.87%**, just **0.08%** below the FP32 baseline of 92.95%, while running its matmuls in integer arithmetic.
+
+---
+
+## Part 3: The grand trade-off — K-Means vs. Linear
+
+Both methods shrink the model, but they're optimized for different things. K-means optimizes **storage**; linear optimizes **compute**.
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Axis</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">K-Means (codebook)</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Linear (affine)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Level placement</td>
+      <td style="padding:9px 14px;background:#f0fdf4;color:#15803d;font-weight:700">Non-uniform (fits the distribution)</td>
+      <td style="padding:9px 14px">Evenly spaced</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Accuracy at very low bits</td>
+      <td style="padding:9px 14px;background:#f0fdf4;color:#15803d;font-weight:700">Better — survives 2–4 bit</td>
+      <td style="padding:9px 14px">Degrades faster</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Inference compute</td>
+      <td style="padding:9px 14px;background:#fef2f2;color:#b91c1c;font-weight:700">FP32 matmul + decode overhead</td>
+      <td style="padding:9px 14px;background:#f0fdf4;color:#15803d;font-weight:700">Integer-only matmul (real speedup)</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Hardware support</td>
+      <td style="padding:9px 14px">Needs codebook lookup</td>
+      <td style="padding:9px 14px;background:#f0fdf4;color:#15803d;font-weight:700">Native int8 on CPUs / NPUs / DSPs</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Retraining (QAT)</td>
+      <td style="padding:9px 14px">Supported (update centroids via STE)</td>
+      <td style="padding:9px 14px">Supported (fake-quantize via STE)</td>
+    </tr>
+  </tbody>
+</table>
+
+### How to choose
+
+- Reach for **k-means** when **storage/bandwidth is the bottleneck** — a model that must fit in a tiny flash budget — and you can afford a custom decode step. Its non-uniform levels keep accuracy alive at aggressive bit-widths.
+- Reach for **linear** when you need **actual latency and energy wins on real hardware**. Integer-only inference runs natively on CPUs, NPUs, and DSPs, and it's the path most production toolchains (TensorRT, TFLite, ONNX Runtime) are built around.
+- The **PTQ-vs-QAT** decision is orthogonal to both: start with cheap PTQ, and escalate to QAT — which *both* schemes support — only when the accuracy drop at your target bit-width blows your budget.
+
+## Conclusion
+
+Quantization works because trained weights live in a narrow band and a network averages away small, zero-mean rounding noise — until the bit-width gets too low to average away. K-means exploits that by clustering weights into an optimally-placed codebook for maximum *storage* compression; linear quantization exploits it with an affine map whose scales factor out of the matmul, unlocking integer-only *compute*. Layered on top of both is the PTQ-vs-QAT lever: quantize cheaply first, and only pay for retraining when your accuracy budget demands it. On our VGG/CIFAR-10 model, that toolkit took a 35.20 MiB FP32 network down to a 2.20 MiB 2-bit codebook (91.25%) or a fully integer int8 model (92.87%) — both within a hair of the 92.95% baseline.
