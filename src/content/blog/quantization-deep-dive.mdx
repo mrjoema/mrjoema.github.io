@@ -169,7 +169,7 @@ That single "quantize once" box above isn't one thing. Once you've decided *not*
 </table>
 
 <figure style="margin:1.5rem 0">
-  <svg viewBox="0 0 760 372" role="img" aria-label="Flow diagram comparing dynamic, static, and weight-only PTQ, split into build-time and production-time" style="max-width:100%;height:auto;background:#0f172a;border-radius:8px;border:1px solid #334155;font-family:ui-sans-serif,system-ui,sans-serif">
+  <svg viewBox="0 0 760 392" role="img" aria-label="Flow diagram comparing dynamic, static, and weight-only PTQ, split into build-time and production-time" style="max-width:100%;height:auto;background:#0f172a;border-radius:8px;border:1px solid #334155;font-family:ui-sans-serif,system-ui,sans-serif">
     <defs>
       <marker id="parrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#94a3b8"/></marker>
       <marker id="parrowL" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#64748b"/></marker>
@@ -224,7 +224,7 @@ That single "quantize once" box above isn't one thing. Once you've decided *not*
     <line x1="368" y1="306" x2="398" y2="306" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#parrow)"/>
     <line x1="504" y1="306" x2="538" y2="306" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#parrowL)"/>
 
-    <text x="14" y="360" fill="#94a3b8" font-size="10.5">Left of the line = built once before shipping. Right = what the live model runs on <tspan fill="#cbd5e1" font-weight="700">every</tspan> request. Only static crosses with nothing left to compute but the matmul itself.</text>
+    <text x="14" fill="#94a3b8" font-size="10.5"><tspan x="14" y="362">Left of the line = built once before shipping. Right = what the live model runs on <tspan fill="#cbd5e1" font-weight="700">every</tspan> request.</tspan><tspan x="14" y="378">Only static crosses the line with nothing left to compute but the matmul itself.</tspan></text>
   </svg>
   <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic"><strong>Deploy</strong> = ship the artifact to production; everything right of the dashed line happens <em>after</em> deploy, on every inference request. Static finishes all its work at build time (pure-integer matmul in prod); dynamic still measures activation ranges per request, and weight-only still dequantizes weights to float per request.</figcaption>
 </figure>
