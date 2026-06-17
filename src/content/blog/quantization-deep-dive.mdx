@@ -97,18 +97,15 @@ The dividing line is **not** "did backprop happen?" — it's *was quantization p
       <marker id="qarrowO" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#f97316"/></marker>
     </defs>
 
-    <text x="14" y="28" fill="#22c55e" font-size="14" font-weight="700">PTQ — quantize once, no retraining</text>
-    <rect x="14"  y="46" width="152" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
-    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="90" y="72">Trained</tspan><tspan x="90" y="90">FP32 model</tspan></text>
-    <rect x="202" y="46" width="152" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
-    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="278" y="72">Calibrate</tspan><tspan x="278" y="90">(measure ranges)</tspan></text>
-    <rect x="390" y="46" width="152" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
-    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="466" y="72">Quantize once</tspan><tspan x="466" y="90">(pick S, Z)</tspan></text>
-    <rect x="578" y="46" width="152" height="60" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="1.8"/>
-    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="654" y="72">INT model</tspan><tspan x="654" y="90">→ deploy</tspan></text>
-    <line x1="166" y1="76" x2="200" y2="76" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
-    <line x1="354" y1="76" x2="388" y2="76" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
-    <line x1="542" y1="76" x2="576" y2="76" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
+    <text x="14" y="28" fill="#22c55e" font-size="14" font-weight="700">PTQ — quantize the finished model, no training loop</text>
+    <rect x="14"  y="46" width="172" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="100" y="72">Trained</tspan><tspan x="100" y="90">FP32 model</tspan></text>
+    <rect x="252" y="46" width="236" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="370" y="72">Quantize once</tspan><tspan x="370" y="90">(no retraining)</tspan></text>
+    <rect x="554" y="46" width="172" height="60" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="1.8"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="12"><tspan x="640" y="72">INT model</tspan><tspan x="640" y="90">→ deploy</tspan></text>
+    <line x1="186" y1="76" x2="250" y2="76" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
+    <line x1="488" y1="76" x2="552" y2="76" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
 
     <text x="14" y="156" fill="#f97316" font-size="14" font-weight="700">QAT — train through quantization (STE)</text>
     <text x="500" y="170" text-anchor="middle" fill="#f97316" font-size="10.5">repeat each step / epoch</text>
@@ -129,8 +126,118 @@ The dividing line is **not** "did backprop happen?" — it's *was quantization p
     <line x1="354" y1="226" x2="388" y2="226" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
     <line x1="604" y1="226" x2="636" y2="226" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#qarrow)"/>
   </svg>
-  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">PTQ is a single forward pass to set quantization parameters. QAT puts quantization <em>inside</em> a training loop: the forward pass runs on quantized weights, and STE lets gradients flow back to full-precision shadow weights that the loop keeps refining.</figcaption>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">The one axis that matters here: PTQ quantizes the already-trained model with <em>no training loop</em> (its internals expand into three flavors just below); QAT puts quantization <em>inside</em> a training loop, where STE lets gradients flow back to full-precision shadow weights that the loop keeps refining.</figcaption>
 </figure>
+
+### PTQ comes in three flavors
+
+That single "quantize once" box above isn't one thing. Once you've decided *not* to retrain, you still have to answer a second question: **what do you quantize ahead of time, and where do the activation ranges come from?** That fork expands the PTQ box into three flavors — and the two labs in this post are each a different one.
+
+<table style="width:100%;border-collapse:collapse;font-size:0.88em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Flavor</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Weights</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Activations</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Calibration data?</th>
+      <th style="text-align:left;padding:10px 14px;font-weight:700">Compute runs in</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Dynamic</td>
+      <td style="padding:9px 14px">quantized offline</td>
+      <td style="padding:9px 14px">quantized <strong>at runtime</strong>, per-inference</td>
+      <td style="padding:9px 14px;color:#15803d;font-weight:700">No</td>
+      <td style="padding:9px 14px">int matmul + live range-calc each call</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Static</td>
+      <td style="padding:9px 14px">quantized offline</td>
+      <td style="padding:9px 14px">quantized offline (fixed <code>S</code>, <code>Z</code>)</td>
+      <td style="padding:9px 14px;color:#b91c1c;font-weight:700">Yes</td>
+      <td style="padding:9px 14px">full integer, end-to-end</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 14px;font-weight:600">Weight-only</td>
+      <td style="padding:9px 14px">quantized offline</td>
+      <td style="padding:9px 14px">left in FP16 / FP32</td>
+      <td style="padding:9px 14px;color:#15803d;font-weight:700">No</td>
+      <td style="padding:9px 14px">float (weights dequantized first)</td>
+    </tr>
+  </tbody>
+</table>
+
+<figure style="margin:1.5rem 0">
+  <svg viewBox="0 0 760 372" role="img" aria-label="Flow diagram comparing dynamic, static, and weight-only PTQ, split into build-time and production-time" style="max-width:100%;height:auto;background:#0f172a;border-radius:8px;border:1px solid #334155;font-family:ui-sans-serif,system-ui,sans-serif">
+    <defs>
+      <marker id="parrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#94a3b8"/></marker>
+      <marker id="parrowL" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#64748b"/></marker>
+    </defs>
+
+    <text x="14" y="20" fill="#94a3b8" font-size="11" font-weight="700" letter-spacing="0.5">BUILD — offline, run once</text>
+    <text x="540" y="20" fill="#94a3b8" font-size="11" font-weight="700" letter-spacing="0.5">PRODUCTION — every request</text>
+    <line x1="518" y1="30" x2="518" y2="344" stroke="#475569" stroke-width="1.3" stroke-dasharray="4 4"/>
+
+    <text x="14" y="44" fill="#38bdf8" font-size="13" font-weight="700">Dynamic — activations quantized at runtime</text>
+    <rect x="14"  y="54" width="104" height="56" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="66" y="78">Trained</tspan><tspan x="66" y="95">FP32 model</tspan></text>
+    <rect x="158" y="54" width="210" height="56" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="263" y="78">Quantize W</tspan><tspan x="263" y="95">(offline)</tspan></text>
+    <rect x="400" y="54" width="104" height="56" rx="8" fill="#1e293b" stroke="#38bdf8" stroke-width="1.8"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11.5"><tspan x="452" y="87">deploy</tspan></text>
+    <rect x="540" y="54" width="206" height="56" rx="8" fill="#0c2533" stroke="#38bdf8" stroke-width="1.6" stroke-dasharray="5 3"/>
+    <text x="643" y="73" text-anchor="middle" fill="#38bdf8" font-size="9.5" font-weight="700">per request</text>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="643" y="90">measure act range</tspan><tspan x="643" y="104">→ int8 matmul</tspan></text>
+    <line x1="118" y1="82" x2="156" y2="82" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#parrow)"/>
+    <line x1="368" y1="82" x2="398" y2="82" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#parrow)"/>
+    <line x1="504" y1="82" x2="538" y2="82" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#parrowL)"/>
+
+    <text x="14" y="156" fill="#22c55e" font-size="13" font-weight="700">Static — calibrate + fuse graph, fully integer</text>
+    <rect x="14"  y="166" width="104" height="56" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="66" y="190">Trained</tspan><tspan x="66" y="207">FP32 model</tspan></text>
+    <rect x="140" y="166" width="112" height="56" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="196" y="190">Calibrate</tspan><tspan x="196" y="207">(act ranges)</tspan></text>
+    <rect x="274" y="166" width="112" height="56" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="330" y="190">Fuse graph +</tspan><tspan x="330" y="207">quant W &amp; A</tspan></text>
+    <rect x="400" y="166" width="104" height="56" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="1.8"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="452" y="190">INT model</tspan><tspan x="452" y="207">deploy</tspan></text>
+    <rect x="540" y="166" width="206" height="56" rx="8" fill="#0f2417" stroke="#22c55e" stroke-width="1.6"/>
+    <text x="643" y="185" text-anchor="middle" fill="#22c55e" font-size="9.5" font-weight="700">per request</text>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="643" y="202">pure int8 matmul</tspan><tspan x="643" y="216">(nothing on the fly)</tspan></text>
+    <line x1="118" y1="194" x2="138" y2="194" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#parrow)"/>
+    <line x1="252" y1="194" x2="272" y2="194" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#parrow)"/>
+    <line x1="386" y1="194" x2="398" y2="194" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#parrow)"/>
+    <line x1="504" y1="194" x2="538" y2="194" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#parrowL)"/>
+
+    <text x="14" y="268" fill="#a78bfa" font-size="13" font-weight="700">Weight-only — weights int4, activations stay FP</text>
+    <rect x="14"  y="278" width="104" height="56" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="66" y="302">Trained</tspan><tspan x="66" y="319">FP32 model</tspan></text>
+    <rect x="158" y="278" width="210" height="56" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="263" y="302">Quantize W → int4</tspan><tspan x="263" y="319">(offline)</tspan></text>
+    <rect x="400" y="278" width="104" height="56" rx="8" fill="#1e293b" stroke="#a78bfa" stroke-width="1.8"/>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11.5"><tspan x="452" y="311">deploy</tspan></text>
+    <rect x="540" y="278" width="206" height="56" rx="8" fill="#1a1330" stroke="#a78bfa" stroke-width="1.6" stroke-dasharray="5 3"/>
+    <text x="643" y="297" text-anchor="middle" fill="#a78bfa" font-size="9.5" font-weight="700">per request</text>
+    <text text-anchor="middle" fill="#e2e8f0" font-size="11"><tspan x="643" y="314">dequant W → FP</tspan><tspan x="643" y="328">float matmul</tspan></text>
+    <line x1="118" y1="306" x2="156" y2="306" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#parrow)"/>
+    <line x1="368" y1="306" x2="398" y2="306" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#parrow)"/>
+    <line x1="504" y1="306" x2="538" y2="306" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#parrowL)"/>
+
+    <text x="14" y="360" fill="#94a3b8" font-size="10.5">Left of the line = built once before shipping. Right = what the live model runs on <tspan fill="#cbd5e1" font-weight="700">every</tspan> request. Only static crosses with nothing left to compute but the matmul itself.</text>
+  </svg>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic"><strong>Deploy</strong> = ship the artifact to production; everything right of the dashed line happens <em>after</em> deploy, on every inference request. Static finishes all its work at build time (pure-integer matmul in prod); dynamic still measures activation ranges per request, and weight-only still dequantizes weights to float per request.</figcaption>
+</figure>
+
+**Dynamic** freezes the weights to int8 offline but quantizes each activation tensor *on the fly* — every inference measures the real min/max and picks a fresh `scale`/`zero_point`, so it never has to guess a range and needs no calibration set. The cost is per-call overhead. It's the default for LSTMs and Transformers, where activation ranges swing hard between inputs.
+
+**Static** bakes fixed `scale`/`zero_point` into *both* weights and activations. Since you commit to activation ranges offline, you need a **calibration pass**: run a few hundred representative batches, observe the activation histograms, and pick ranges (min/max, percentile, or KL-divergence). After that everything is integer at runtime — no per-call range math, and the only flavor that's truly integer-only end-to-end. **This is the linear int8 path in this post** — the "handful of batches to *calibrate*" above is exactly the static-PTQ calibration step.
+
+**Weight-only** quantizes just the weights (often int4/int3) and leaves activations in FP16; at compute time the weights are dequantized back to float and the matmul runs in float. There's no integer-compute speedup — the win is pure memory and bandwidth, because you load 4-bit weights instead of 32-bit. It dominates LLM serving (GPTQ, AWQ), where the bottleneck is *fetching* a giant weight matrix, not the arithmetic. **The k-means codebook lab is morally weight-only**: it compresses *storage*, and weights are decompressed for compute — which is why the codebook scheme unlocks storage compression while linear unlocks integer compute.
+
+> **The "graph update" that static needs (and the others mostly don't).** Static PTQ isn't just picking numbers — it **rewrites the model graph**: insert quant/dequant nodes (`QuantStub`/`DeQuantStub`) at the integer-domain boundaries, **fuse** `Conv → BN → ReLU` into a single int kernel so you don't round-trip to float between layers, and **swap each op for its integer kernel**. In PyTorch that's the `prepare()` (insert observers, calibrate) → `convert()` (rewrite to int kernels) two-step. Dynamic skips calibration and the heavy fusion; weight-only just repacks the weight tensors and leaves the activation graph in float.
+
+So the one-line mental model: **dynamic** = quantize weights, measure activations live; **static** = quantize everything offline + calibrate + fuse the graph (← the int8 lab); **weight-only** = quantize weights only, for memory (← the codebook lab).
 
 ### How do you choose? Set an accuracy budget.
 
@@ -174,6 +281,100 @@ There's a problem hiding in QAT: rounding is a step function, so its gradient is
 > Round in the forward pass so the network feels the quantization error — but on the backward pass, pretend the rounding was the identity function and let the gradient pass *straight through* it. Those gradients update a full-precision "shadow" copy of the weights, which is re-quantized on the next step.
 
 So QAT always keeps the real, continuous weights around: quantization happens on the forward pass, and learning happens in full precision. In the k-means variant we'll see in Part 1, the same idea appears as centroids that are recomputed as the **mean of the weights** assigned to each cluster — the codebook chases the weights as they move.
+
+### What fake-quantize actually does to one value
+
+A fake-quant node is the heart of QAT, and the operation itself is tiny: **take a float, snap it to the nearest grid point, hand back a float.** Nothing becomes int8 — input and output are both FP32; only the *value* changes. Plotted, the forward pass is a staircase:
+
+<figure style="margin:1.5rem 0">
+  <svg viewBox="0 0 760 340" role="img" aria-label="Fake-quantize staircase: a continuous input snapped to grid values, with the straight-through identity used on the backward pass" style="max-width:100%;height:auto;background:#0f172a;border-radius:8px;border:1px solid #334155;font-family:ui-sans-serif,system-ui,sans-serif">
+    <defs>
+      <marker id="faxis" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#64748b"/></marker>
+    </defs>
+    <line x1="110" y1="278" x2="110" y2="48" stroke="#64748b" stroke-width="1.3" marker-end="url(#faxis)"/>
+    <line x1="110" y1="278" x2="572" y2="278" stroke="#64748b" stroke-width="1.3" marker-end="url(#faxis)"/>
+
+    <line x1="110" y1="269" x2="540" y2="42" stroke="#38bdf8" stroke-width="1.6" stroke-dasharray="6 4"/>
+    <path d="M110,250 H182 V212 H254 V174 H326 V136 H398 V98 H470 V60 H540" fill="none" stroke="#fbbf24" stroke-width="2.6"/>
+
+    <text x="140" y="92" fill="#38bdf8" font-size="11" font-weight="700"><tspan x="140" y="92">backward (STE):</tspan><tspan x="140" y="108">pretend slope = 1, gradient flows</tspan></text>
+    <text x="356" y="232" fill="#fbbf24" font-size="11" font-weight="700"><tspan x="356" y="232">forward:</tspan><tspan x="356" y="248">snap to nearest step</tspan></text>
+
+    <text x="116" y="242" fill="#94a3b8" font-size="9.5">clamp to q_min</text>
+    <text x="468" y="54" fill="#94a3b8" font-size="9.5">clamp to q_max</text>
+
+    <line x1="552" y1="98"  x2="552" y2="136" stroke="#94a3b8" stroke-width="1"/>
+    <line x1="548" y1="98"  x2="556" y2="98"  stroke="#94a3b8" stroke-width="1"/>
+    <line x1="548" y1="136" x2="556" y2="136" stroke="#94a3b8" stroke-width="1"/>
+    <text x="560" y="122" fill="#94a3b8" font-size="10">S = one int step</text>
+
+    <text x="338" y="300" text-anchor="middle" fill="#cbd5e1" font-size="11">input  r  (continuous FP32)</text>
+    <text transform="rotate(-90 84 163)" x="84" y="163" text-anchor="middle" fill="#cbd5e1" font-size="11">output  r̂  (snapped to grid)</text>
+
+    <text x="14" y="326" fill="#94a3b8" font-size="10.5">Forward: r → round(r/S)+Z → clamp(q_min, q_max) → (q−Z)·S → r̂ , a float that lands exactly on the grid.  Backward: identity.</text>
+  </svg>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">Fake-quantize = quantize <em>then immediately dequantize</em>. The amber staircase is the forward pass (every input in a bin is pulled to that bin's value; the ends flatten — that's the clamp). Its true gradient is 0 almost everywhere, so the STE substitutes the blue diagonal (slope 1) on the backward pass, letting gradients reach the underlying weight.</figcaption>
+</figure>
+
+The catch the diagram makes obvious: the staircase is **flat almost everywhere**, so its real derivative is 0 — plain backprop would zero out every gradient and the model could never learn. The STE's whole job is to *lie* on the backward pass and pretend the step was that straight diagonal, so the gradient passes through unchanged.
+
+That's also **why the weights must stay FP32 during training**, which is the part that's easy to miss:
+
+- A gradient step is a tiny nudge, say `w -= 0.0007`. If the grid spacing `S` is `0.004`, that nudge is *smaller than one step*. Had `w` been stored as int8, `0.0007` would round to zero and the weight could never move.
+- So you keep a full-precision **master copy** of `w`. Those sub-step nudges **accumulate** in it across many batches until `w` finally crosses into the next bin — at which point the fake-quant output jumps to the next step. The float weight glides; the value it emits moves in discrete hops.
+
+So during training you carry *both*: an FP32 master weight that gradients update, and the fake-quant view of it that the loss sees. **That FP32 master weight is the "continuous thing for gradients to flow through"** — it exists precisely so tiny updates aren't lost to rounding.
+
+### Same network, two dtypes: what actually flows between layers
+
+A trap worth calling out: during QAT, are the activations between layers *already INT8*? **No.** You have to keep two pictures separate — what flows while you **train**, and what flows once you **deploy** — because they differ in *dtype* even when the numbers look identical.
+
+- **During QAT training**, every tensor — inputs, weights, activations — is still stored as **FP32**. As the staircase above showed, fake-quant only rounds each value onto the int8 *grid* (`0.1234567 → 0.1250000`): the numbers look as coarse as int8, but the dtype stays float and **every op runs in full precision** (so gradients have somewhere continuous to land).
+- **At deployment**, the fake-quant nodes are swapped for real quantize ops. **One** Quantize op at the very front turns the FP32 input (e.g. a camera frame) into int8; from there each layer *consumes* int8 and *emits* int8, with no float in the hot path. Only that first input conversion (and, at the end, a dequant of the logits) ever touches float.
+
+<figure style="margin:1.5rem 0">
+  <svg viewBox="0 0 760 300" role="img" aria-label="Diagram contrasting tensor dtypes between layers during QAT training versus deployed inference" style="max-width:100%;height:auto;background:#0f172a;border-radius:8px;border:1px solid #334155;font-family:ui-sans-serif,system-ui,sans-serif">
+    <defs>
+      <marker id="darrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#94a3b8"/></marker>
+    </defs>
+
+    <text x="14" y="30" fill="#f97316" font-size="13.5" font-weight="700">QAT forward pass (training) — every tensor is FP32, holding fake-int8 values</text>
+    <line x1="124" y1="73" x2="744" y2="73" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#darrow)"/>
+    <rect x="14"  y="46" width="110" height="54" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" font-size="11"><tspan x="69" y="68" fill="#e2e8f0">Input</tspan><tspan x="69" y="86" fill="#93c5fd" font-weight="700">FP32</tspan></text>
+    <rect x="169" y="46" width="110" height="54" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" font-size="11"><tspan x="224" y="68" fill="#e2e8f0">Conv 1</tspan><tspan x="224" y="86" fill="#fbbf24" font-weight="700">FP32 (≈int8)</tspan></text>
+    <rect x="324" y="46" width="110" height="54" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" font-size="11"><tspan x="379" y="68" fill="#e2e8f0">Conv 2</tspan><tspan x="379" y="86" fill="#fbbf24" font-weight="700">FP32 (≈int8)</tspan></text>
+    <rect x="479" y="46" width="110" height="54" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" font-size="11"><tspan x="534" y="68" fill="#e2e8f0">Conv 3</tspan><tspan x="534" y="86" fill="#fbbf24" font-weight="700">FP32 (≈int8)</tspan></text>
+    <rect x="634" y="46" width="110" height="54" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" font-size="11"><tspan x="689" y="68" fill="#e2e8f0">logits</tspan><tspan x="689" y="86" fill="#93c5fd" font-weight="700">FP32</tspan></text>
+    <circle cx="146" cy="73" r="13" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/><text x="146" y="77" text-anchor="middle" fill="#fbbf24" font-size="9" font-weight="700">fq</text>
+    <circle cx="301" cy="73" r="13" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/><text x="301" y="77" text-anchor="middle" fill="#fbbf24" font-size="9" font-weight="700">fq</text>
+    <circle cx="456" cy="73" r="13" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/><text x="456" y="77" text-anchor="middle" fill="#fbbf24" font-size="9" font-weight="700">fq</text>
+    <circle cx="611" cy="73" r="13" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/><text x="611" y="77" text-anchor="middle" fill="#fbbf24" font-size="9" font-weight="700">fq</text>
+    <text x="14" y="124" fill="#94a3b8" font-size="10.5"><tspan fill="#fbbf24" font-weight="700">fq</tspan> = fake-quantize (round → dequantize). The values look int8-coarse, but the dtype is FP32 — that's what autograd needs.</text>
+
+    <text x="14" y="176" fill="#22c55e" font-size="13.5" font-weight="700">Deployed inference — activations are real INT8 between layers</text>
+    <line x1="124" y1="219" x2="744" y2="219" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#darrow)"/>
+    <rect x="14"  y="192" width="110" height="54" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" font-size="11"><tspan x="69" y="214" fill="#e2e8f0">Input</tspan><tspan x="69" y="232" fill="#93c5fd" font-weight="700">FP32</tspan></text>
+    <rect x="169" y="192" width="110" height="54" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" font-size="11"><tspan x="224" y="214" fill="#e2e8f0">Conv 1</tspan><tspan x="224" y="232" fill="#4ade80" font-weight="700">INT8</tspan></text>
+    <rect x="324" y="192" width="110" height="54" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" font-size="11"><tspan x="379" y="214" fill="#e2e8f0">Conv 2</tspan><tspan x="379" y="232" fill="#4ade80" font-weight="700">INT8</tspan></text>
+    <rect x="479" y="192" width="110" height="54" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" font-size="11"><tspan x="534" y="214" fill="#e2e8f0">Conv 3</tspan><tspan x="534" y="232" fill="#4ade80" font-weight="700">INT8</tspan></text>
+    <rect x="634" y="192" width="110" height="54" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text text-anchor="middle" font-size="11"><tspan x="689" y="214" fill="#e2e8f0">logits</tspan><tspan x="689" y="232" fill="#93c5fd" font-weight="700">→ FP32</tspan></text>
+    <circle cx="146" cy="219" r="14" fill="#0f172a" stroke="#4ade80" stroke-width="1.6"/><text x="146" y="223" text-anchor="middle" fill="#4ade80" font-size="9" font-weight="700">Q</text>
+    <text x="14" y="270" fill="#94a3b8" font-size="10.5"><tspan fill="#4ade80" font-weight="700">Q</tspan> = one real quantize at the front (FP32 → int8). After it, every layer eats int8 and emits int8 — no float until the final dequant.</text>
+  </svg>
+  <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">Same architecture, two regimes. In <strong>QAT training</strong> the tensors are FP32 that merely <em>simulate</em> int8 (one fake-quant per step, so gradients can flow); in <strong>deployment</strong> the input is quantized once and the activations are genuinely int8 from layer to layer.</figcaption>
+</figure>
+
+So "the activations are int8" is true of the **deployed** model, not the QAT training run. During training they're FP32 carrying int8-grid values; the int8 only becomes physically real at the convert step below.
 
 ### The two regimes, in code
 
@@ -347,15 +548,31 @@ q = round(r / S) + Z       (quantize, then clamp to [q_min, q_max])
   <figcaption style="margin-top:0.5rem;font-size:0.78rem;color:rgb(150,150,160);font-style:italic">2-bit linear quantization: floats map to evenly-spaced integer codes (left → middle), and dequantizing reconstructs them onto a uniform grid (right). Unlike k-means, the levels are equally spaced — which is exactly what lets the scale factor out of the matmul.</figcaption>
 </figure>
 
-### Choosing the parameters
+### Choosing the parameters: computing S and Z
 
-From the tensor's observed float range and the target integer range:
+`S` and `Z` fall out of two ranges — the **float range** the tensor actually occupies and the **integer range** the bit-width gives you. Four steps:
+
+1. **Observe the float range** `[r_min, r_max]`. For **weights** you read it straight off the tensor (you already have them). For **activations** you can't know it until data flows, so you *calibrate*: push a few batches through and record the min/max (static PTQ), or measure it live per batch (dynamic).
+2. **Fix the integer range** `[q_min, q_max]` from the bit-width and signedness — signed int8 → `[−128, 127]`; unsigned uint8 (e.g. a ReLU output that's never negative) → `[0, 255]`.
+3. **Scale** — how much real value one integer step covers:
+   `S = (r_max − r_min) / (q_max − q_min)`
+4. **Zero-point** — the integer code that maps exactly onto real `0.0`, clamped into range:
+   `Z = clamp( round(q_min − r_min / S), q_min, q_max )`
 
 ```python
 scale = (fp_max - fp_min) / (quantized_max - quantized_min)
 zero_point = round(quantized_min - fp_min / scale)
 zero_point = max(quantized_min, min(quantized_max, zero_point))  # clamp
 ```
+
+**Worked example** (an asymmetric activation, signed int8). Suppose a layer's outputs land in `[−2.0, 6.0]` and the target is int8 `[−128, 127]`:
+
+- `S = (6.0 − (−2.0)) / (127 − (−128)) = 8.0 / 255 ≈ 0.0314`
+- `Z = round(−128 − (−2.0 / 0.0314)) = round(−128 + 63.7) = round(−64.3) = −64`
+
+So real `0.0` is stored as the code `−64`, and each integer step is worth `≈ 0.0314`. **Symmetric shortcut:** when the range is symmetric (the usual case for weights), set `Z = 0` and `S = max(|r|) / q_max`. No offset is needed — and a zero `Z` also drops terms from the integer matmul below, making inference cheaper.
+
+With `S` and `Z` in hand, quantizing is the affine rule, rounded and clamped:
 
 ```python
 def linear_quantize(fp_tensor, bitwidth, scale, zero_point, dtype=torch.int8):
@@ -387,6 +604,55 @@ q_out = round( (Sᵥᵥ·Sₓ / S_out) · accumulator ) + Z_out
 ```python
 bias_scale = input_scale * weight_scale
 ```
+
+### Which formula runs when
+
+There are really only a handful of formulas in linear quantization, and the confusion is almost always about *which one fires at which phase* — calibration vs. QAT training vs. convert vs. inference. `S` and `Z` are computed **once** and then reused everywhere; what changes is the formula that consumes them:
+
+<table style="width:100%;border-collapse:collapse;font-size:0.84em;margin:1.25rem 0">
+  <thead>
+    <tr style="background:#1e293b;color:#fff">
+      <th style="text-align:left;padding:10px 12px;font-weight:700">Phase</th>
+      <th style="text-align:left;padding:10px 12px;font-weight:700">What happens</th>
+      <th style="text-align:left;padding:10px 12px;font-weight:700">Formula</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 12px;font-weight:600">Choose params<br/><span style="color:#64748b;font-weight:400">weights offline · activations via calibration</span></td>
+      <td style="padding:9px 12px">derive <code>S</code>, <code>Z</code> from the ranges</td>
+      <td style="padding:9px 12px"><code>S = (r_max−r_min)/(q_max−q_min)</code><br/><code>Z = clamp(round(q_min − r_min/S))</code></td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 12px;font-weight:600">QAT training — forward</td>
+      <td style="padding:9px 12px"><strong>fake-quant</strong>: round then dequant, STE on the backward pass</td>
+      <td style="padding:9px 12px"><code>r̂ = S·(clamp(round(r/S)+Z) − Z)</code><br/><span style="color:#64748b">backward: identity</span></td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 12px;font-weight:600">Convert<br/><span style="color:#64748b;font-weight:400">after PTQ calibration / after QAT</span></td>
+      <td style="padding:9px 12px"><strong>quantize</strong> weights to int storage, once</td>
+      <td style="padding:9px 12px"><code>q = clamp(round(r/S)+Z)</code></td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 12px;font-weight:600">Inference — per layer</td>
+      <td style="padding:9px 12px"><strong>integer matmul</strong>, then requantize into the next layer</td>
+      <td style="padding:9px 12px"><code>acc = Σ(q_w−Z_w)(q_x−Z_x)</code><br/><code>q_out = round((S_w·S_x/S_out)·acc) + Z_out</code></td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0">
+      <td style="padding:9px 12px;font-weight:600">Inference — final output</td>
+      <td style="padding:9px 12px"><strong>dequantize</strong> back to float logits</td>
+      <td style="padding:9px 12px"><code>r = S·(q − Z)</code></td>
+    </tr>
+  </tbody>
+</table>
+
+Read as a timeline:
+
+- **Training (QAT)** runs only **fake-quant** in the forward pass — `r → r̂`, both FP32 — plus the STE identity on the backward pass. No real int8 and no integer matmul exist yet.
+- **Convert** applies **quantize** once to turn the FP32 weights into int8 storage (`q`) and freezes the `S`/`Z` you measured.
+- **Inference** runs the **integer matmul + requantize** between layers, and **dequantize** only at the very end to read out float logits.
+
+In other words, *fake-quant is a training-only stand-in for the real quantize-plus-integer-matmul that only shows up at inference* — same `S` and `Z` throughout, different formula consuming them at each phase.
 
 ### Two fusions that make it clean
 
