@@ -205,7 +205,7 @@ def channel_prune(model: nn.Module, prune_ratio: Union[List, float]) -> nn.Modul
 
 ### 2. Structured Selection: Channel Sorting by Importance
 
-Naively keeping the first *K* channels is suboptimal. We want to keep the channels that contain the most information. We compute the importance of each input channel based on the L₂ norm of its weights, sort the channels, and keep the top ones:
+Naively keeping the first *K* channels is suboptimal. We want to keep the channels that contain the most information. We compute the importance of each input channel based on the L₂ norm of its weights, $\lVert \mathbf{w}_c \rVert_2 = \sqrt{\sum_i w_{c,i}^{\,2}}$, sort the channels, and keep the top ones:
 
 ```python
 def get_input_channel_importance(weight: torch.Tensor) -> torch.Tensor:
@@ -293,7 +293,7 @@ MACs (M)        606             305             2.0
 Param (M)       9.23            5.01            1.8
 ```
 
-First, notice that a **30% channel pruning ratio produces a ~2× (50%) MAC reduction**, not 30%. This is because pruning compounds across consecutive layers: the MACs of a convolution are proportional to *C_in × C_out*, and channel pruning shrinks *both* — the pruned output channels of one layer become the pruned input channels of the next. Keeping 70% of channels on each side gives roughly 0.7 × 0.7 ≈ 0.49 of the original computation, i.e. about half.
+First, notice that a **30% channel pruning ratio produces a ~2× (50%) MAC reduction**, not 30%. This is because pruning compounds across consecutive layers: the MACs of a convolution are proportional to $C_{\text{in}} \times C_{\text{out}}$, and channel pruning shrinks *both* — the pruned output channels of one layer become the pruned input channels of the next. Keeping 70% of channels on each side gives roughly $0.7 \times 0.7 \approx 0.49$ of the original computation, i.e. about half.
 
 But while MACs are cut in half (2×) and parameters drop by nearly half too, the wall-clock **latency only improves by 1.7×, not 2×**. Why?
 

@@ -36,7 +36,7 @@ So we stop describing weights in absolute, galaxy-scale units. We pick the small
 With 8 bits we keep 256 distinct levels across the weight band, so each weight is snapped to its nearest level — off by at most half a tiny step. Two things then make that error nearly free:
 
 1. **The decision is an argmax over 10 classes.** When the network is confident, small wiggles in the output don't change *which* class is largest.
-2. **The errors cancel.** A neuron sums hundreds of `weight × input` terms. The rounding errors are random and roughly zero-mean, so across the sum they largely cancel — the signal grows like *N*, but the noise only like √N.
+2. **The errors cancel.** A neuron sums hundreds of `weight × input` terms. The rounding errors are random and roughly zero-mean, so across the sum they largely cancel — the signal grows like $N$, but the noise only like $\sqrt{N}$.
 
 > **The one idea to remember:** quantization adds a small, zero-mean noise to each weight, and a wide network *averages that noise away* — right up until the noise gets too big to average away.
 
@@ -533,10 +533,10 @@ The mean is not arbitrary: for a fixed cluster assignment, the mean is the value
 
 K-means compresses storage but still computes in floating point. **Linear quantization** is built to do the opposite: run the actual arithmetic in integers. It maps real values to integers with a simple affine rule:
 
-```
-r = S · (q − Z)            (dequantize)
-q = round(r / S) + Z       (quantize, then clamp to [q_min, q_max])
-```
+$$
+\hat{r} = S\,(q - Z) \quad\text{(dequantize)}, \qquad
+q = \operatorname{clamp}\!\big(\operatorname{round}(r / S) + Z,\; q_{\min},\, q_{\max}\big) \quad\text{(quantize)}
+$$
 
 - **`S` (scale)** — a float: the real-world size of one integer step.
 - **`Z` (zero-point)** — an integer: the code that represents real `0.0` exactly.
@@ -552,12 +552,12 @@ q = round(r / S) + Z       (quantize, then clamp to [q_min, q_max])
 
 `S` and `Z` fall out of two ranges — the **float range** the tensor actually occupies and the **integer range** the bit-width gives you. Four steps:
 
-1. **Observe the float range** `[r_min, r_max]`. For **weights** you read it straight off the tensor (you already have them). For **activations** you can't know it until data flows, so you *calibrate*: push a few batches through and record the min/max (static PTQ), or measure it live per batch (dynamic).
-2. **Fix the integer range** `[q_min, q_max]` from the bit-width and signedness — signed int8 → `[−128, 127]`; unsigned uint8 (e.g. a ReLU output that's never negative) → `[0, 255]`.
+1. **Observe the float range** $[\,r_{\min}, r_{\max}\,]$. For **weights** you read it straight off the tensor (you already have them). For **activations** you can't know it until data flows, so you *calibrate*: push a few batches through and record the min/max (static PTQ), or measure it live per batch (dynamic).
+2. **Fix the integer range** $[\,q_{\min}, q_{\max}\,]$ from the bit-width and signedness — signed int8 → $[-128, 127]$; unsigned uint8 (e.g. a ReLU output that's never negative) → $[0, 255]$.
 3. **Scale** — how much real value one integer step covers:
-   `S = (r_max − r_min) / (q_max − q_min)`
+   $S = \dfrac{r_{\max} - r_{\min}}{q_{\max} - q_{\min}}$
 4. **Zero-point** — the integer code that maps exactly onto real `0.0`, clamped into range:
-   `Z = clamp( round(q_min − r_min / S), q_min, q_max )`
+   $Z = \operatorname{clamp}\!\big(\operatorname{round}(q_{\min} - r_{\min}/S),\; q_{\min}, q_{\max}\big)$
 
 ```python
 scale = (fp_max - fp_min) / (quantized_max - quantized_min)
@@ -567,10 +567,10 @@ zero_point = max(quantized_min, min(quantized_max, zero_point))  # clamp
 
 **Worked example** (an asymmetric activation, signed int8). Suppose a layer's outputs land in `[−2.0, 6.0]` and the target is int8 `[−128, 127]`:
 
-- `S = (6.0 − (−2.0)) / (127 − (−128)) = 8.0 / 255 ≈ 0.0314`
-- `Z = round(−128 − (−2.0 / 0.0314)) = round(−128 + 63.7) = round(−64.3) = −64`
+- $S = \dfrac{6.0 - (-2.0)}{127 - (-128)} = \dfrac{8.0}{255} \approx 0.0314$
+- $Z = \operatorname{round}\!\big(-128 - (-2.0 / 0.0314)\big) = \operatorname{round}(-128 + 63.7) = \operatorname{round}(-64.3) = -64$
 
-So real `0.0` is stored as the code `−64`, and each integer step is worth `≈ 0.0314`. **Symmetric shortcut:** when the range is symmetric (the usual case for weights), set `Z = 0` and `S = max(|r|) / q_max`. No offset is needed — and a zero `Z` also drops terms from the integer matmul below, making inference cheaper.
+So real `0.0` is stored as the code `−64`, and each integer step is worth `≈ 0.0314`. **Symmetric shortcut:** when the range is symmetric (the usual case for weights), set $Z = 0$ and $S = \max(|r|) / q_{\max}$. No offset is needed — and a zero `Z` also drops terms from the integer matmul below, making inference cheaper.
 
 With `S` and `Z` in hand, quantizing is the affine rule, rounded and clamped:
 
