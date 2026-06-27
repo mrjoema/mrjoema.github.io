@@ -354,6 +354,51 @@ The variants differ by *what* gets quantized and *when* the activation ranges ar
   (keeping the learned scales), and the deployed activations flow as int8 with an FP32 output at the
   boundary.
 
+All four are a handful of lines on top of the pruned FP32 model. The thing to read off the code is
+*how much machinery each one needs* — weight-only is a tensor rewrite, static needs a calibration
+loop, QAT needs an actual training loop:
+
+```python
+import copy, torch, torch.nn as nn
+torch.backends.quantized.engine = 'qnnpack'   # ARM / Apple Silicon int8 backend; quantized ops are CPU-only
+example_inputs = (torch.randn(1, 3, 224, 224),)
+
+# (A) Weight-only — round each conv/linear weight to int8 with a PER-OUTPUT-CHANNEL scale (S = max|w|/127),
+#     activations stay FP32. No data, no training. Here we fake it (quantize->dequantize) to read the accuracy hit.
+def fake_weight_int8(m):
+    mc = copy.deepcopy(m)
+    for mod in mc.modules():
+        if isinstance(mod, (nn.Conv2d, nn.Linear)):
+            w = mod.weight.detach(); dims = tuple(range(1, w.dim()))     # reduce over all but the output dim
+            scale = (w.abs().amax(dim=dims, keepdim=True) / 127).clamp(min=1e-8)
+            mod.weight.data = torch.round(w / scale).clamp(-127, 127) * scale
+    return mc
+
+# (B) Dynamic — weights int8, activation ranges picked at runtime. Only has Linear/LSTM kernels, so on a
+#     conv-heavy ResNet it touches just the head Linears -> barely shrinks (the 1.1x row).
+from torch.ao.quantization import quantize_dynamic
+md = quantize_dynamic(copy.deepcopy(fp32), {nn.Linear}, dtype=torch.qint8)
+
+# (C) Static — weights AND activations int8. prepare_fx inserts OBSERVERS; calibration runs representative
+#     data to fix activation ranges (weights need none); convert_fx swaps in real int8 ops. FX auto-fuses conv-bn-relu.
+from torch.ao.quantization import quantize_fx, get_default_qconfig_mapping
+prepared = quantize_fx.prepare_fx(copy.deepcopy(fp32).eval(), get_default_qconfig_mapping('qnnpack'), example_inputs)
+with torch.no_grad():
+    for i, (x, _, _) in enumerate(calib_loader):   # a few hundred images is plenty
+        prepared(x)
+        if i >= 7: break
+static_int8 = quantize_fx.convert_fx(prepared)
+
+# (D) QAT — prepare_qat_fx inserts FAKE-QUANT (quant->dequant, FP32 forward, straight-through backward) so the
+#     net LEARNS to tolerate int8. Fine-tune from the pruned weights, then convert to real int8 ops.
+from torch.ao.quantization import get_default_qat_qconfig_mapping
+qat = quantize_fx.prepare_qat_fx(copy.deepcopy(fp32).train(), get_default_qat_qconfig_mapping('qnnpack'), example_inputs)
+opt = torch.optim.AdamW(qat.parameters(), lr=1e-5, weight_decay=1e-4)
+for _ in range(QAT_EPOCHS):
+    run_epoch_mt(qat, train_loader, 'cpu', opt, lam=LAMBDA)   # ordinary training loop, just with fake-quant in the graph
+qat_int8 = quantize_fx.convert_fx(qat.eval())
+```
+
 <table style="width:100%;border-collapse:collapse;font-size:0.86em;margin:1.25rem 0">
   <thead>
     <tr style="background:#1e293b;color:#fff">
