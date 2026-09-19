@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="330" viewBox="0 0 560 330" role="img" aria-labelledby="title desc">
+  <title id="title">Repeat for every filter</title>
+  <desc id="desc">The same input with three channels feeds filter 0 and filter 1. Each filter has its own kernels and produces one output channel. The two outputs become feature maps for the next layer.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10Z" fill="#64748b"/></marker>
+  </defs>
+  <rect width="560" height="330" rx="16" fill="#f8fafc"/>
+  <g font-family="Arial, sans-serif" fill="#172033">
+    <text x="24" y="38" font-size="23" font-weight="700">M filters → M output channels</text>
+    <text x="24" y="68" font-size="19" fill="#475569">Example: the same 3 channels feed both filters.</text>
+    <rect x="24" y="132" width="132" height="90" rx="10" fill="#e2e8f0"/>
+    <text x="90" y="169" text-anchor="middle" font-size="21" font-weight="700">Input</text>
+    <text x="90" y="199" text-anchor="middle" font-size="20">3 channels</text>
+    <g fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M156 177H183V132H209"/><path d="M183 177V226H209"/>
+      <path d="M339 132H366"/><path d="M339 226H366"/>
+    </g>
+    <rect x="216" y="96" width="123" height="72" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+    <rect x="216" y="190" width="123" height="72" rx="10" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+    <g text-anchor="middle">
+      <text x="277" y="125" font-size="21" font-weight="700" fill="#1d4ed8">Filter 0</text>
+      <text x="277" y="151" font-size="18">3 kernels</text>
+      <text x="277" y="219" font-size="21" font-weight="700" fill="#6d28d9">Filter 1</text>
+      <text x="277" y="245" font-size="18">3 kernels</text>
+    </g>
+    <rect x="374" y="96" width="162" height="72" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="1.5"/>
+    <rect x="374" y="190" width="162" height="72" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="1.5"/>
+    <g text-anchor="middle" font-size="21" fill="#166534">
+      <text x="455" y="125" font-weight="700">Output</text><text x="455" y="151">channel 0</text>
+      <text x="455" y="219" font-weight="700">Output</text><text x="455" y="245">channel 1</text>
+    </g>
+    <text x="280" y="304" text-anchor="middle" font-size="19" fill="#475569">Outputs → input feature maps for the next layer</text>
+  </g>
+</svg>

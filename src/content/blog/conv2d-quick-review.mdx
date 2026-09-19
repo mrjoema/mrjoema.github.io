@@ -1,0 +1,58 @@
+---
+title: 'Conv2d Quick Review'
+description: 'My quick recall notes: weights, filters, per-channel kernels, and how input channels become output channels.'
+pubDate: '2026-09-18'
+type: 'concept'
+tags: ['aiml']
+---
+
+My way to recall a standard Conv2d layer (`groups=1`). Bias is omitted here to focus on the weights.
+
+**Weights → filters → kernels**
+
+- The layer's weights are a set of **M filters**.
+- Input has **N channels** → each filter has **N 2D kernels**.
+- Here, “kernel” means the 2D slice of a filter for one input channel.
+
+<img src="/conv2d-quick-review/weights-filters-kernels.svg" alt="Example with two filters in the layer's weights. Each filter contains three 2D kernels, one for each of the three input channels." width="560" height="300" loading="lazy" />
+
+**One filter → one output channel**
+
+- Kernel 0 operates on input channel 0.
+- Kernel 1 operates on input channel 1.
+- …
+- Kernel N−1 operates on input channel N−1.
+- **Sum the resulting maps, element by element**, to get one output channel.
+
+<img src="/conv2d-quick-review/one-filter-one-output.svg" alt="For one filter, each of three input channels is convolved with its corresponding kernel. The three resulting maps are summed element by element into one output channel." width="560" height="420" loading="lazy" />
+
+**This formula computes one output channel at a time:** hold filter $m$ fixed and sum over all $N$ input channels.
+
+$$
+Y_m = \sum_{n=0}^{N-1} X_n \times K_{m,n},
+\qquad m = 0, \ldots, M-1
+$$
+
+- $N$: number of input channels; each filter contains $N$ 2D kernels.
+- $M$: number of filters, equal to the number of output channels.
+- $X_n$: input channel $n$.
+- $K_{m,n}$: filter $m$'s 2D kernel for input channel $n$.
+- $Y_m$: output channel $m$.
+
+In my notation, $\times$ means applying the 2D kernel to its channel using Conv2d's cross-correlation operation, not ordinary multiplication. The sum combines the resulting maps element by element.
+
+**Repeat for each filter**
+
+- Each filter uses the **same input channels**, with its **own learned kernels**.
+- **M filters → M output channels.**
+- Those output channels become input feature maps for the next layer.
+
+Repeat the formula for $m = 0, \ldots, M-1$, then **stack the outputs along the channel dimension**:
+
+$$
+Y = \operatorname{stack}(Y_0, Y_1, \ldots, Y_{M-1})
+$$
+
+<img src="/conv2d-quick-review/multiple-filters.svg" alt="The same three input channels feed two different filters. Filter 0 produces output channel 0, and filter 1 produces output channel 1. Together these form the next layer's input feature maps." width="560" height="330" loading="lazy" />
+
+**Recall: sum across N input channels → one output channel. Repeat across M filters → M output channels.**
