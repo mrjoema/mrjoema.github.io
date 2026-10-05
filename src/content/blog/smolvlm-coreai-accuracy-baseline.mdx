@@ -1,0 +1,183 @@
+---
+title: 'SmolVLM on Core AI — Part 1: Accuracy Repair'
+description: 'The precision controls I applied after default BF16 conversion, how I verified the complete model against PyTorch MPS, and the accuracy and performance results before further optimization.'
+pubDate: '2026-10-04'
+type: 'experiment'
+tags: ['aiml', 'pytorch', 'core-ai', 'apple-silicon', 'vision-language-model', 'performance']
+---
+
+<div className="compact-report">
+
+I kept the original BF16 PyTorch MPS model as the reference and repaired
+numerical differences after Core AI conversion, without changing the learned
+architecture or source weight values. The final complete Core AI engine now
+matches **all 44 answers and full token sequences**, including **13/13 captions**.
+Both engines score **27/31 VQA correct (87.1%)**.
+
+The earlier candidate matched 41/44. Native normalization, BF16 boundaries and a
+cached-QK accumulation control restored the remaining outputs. The performance
+table below now compares the original PyTorch baseline with this final repaired
+Core AI model, using the same short warmed benchmark.
+
+## The reference I kept fixed
+
+| Setting | Reference / candidate |
+| --- | --- |
+| Model | `HuggingFaceTB/SmolVLM-256M-Instruct` |
+| Revision | `7e3e67edbbed1bf9888184d9df282b700a323964` |
+| Reference engine | Original Hugging Face model, BF16 PyTorch MPS, eager attention |
+| Candidate engine | All learned components in Core AI; preprocessing, merge and token selection on the host |
+| Machine | Apple M4 Pro, 48 GiB unified memory, macOS 27 |
+| Versions | Torch 2.9.0, Transformers 4.57.1, coreai-core 1.0.0b3, coreai-torch 0.4.3 |
+| Generation | Greedy; fixed images/prompts, checkpoint and token budget |
+
+The learned architecture and source weight values stayed unchanged. The repaired
+Core AI model uses BF16 source parameters/IO with selected FP32 internal compute;
+it is not an all-BF16-compute or integer-quantized model.
+
+## Actions to fix accuracy after conversion
+
+| Action | Before / cause | Repair |
+| --- | --- | --- |
+| **Reimplement vision LayerNorm using native MPS arithmetic** | Generic FP32 centered-square variance differed from the reference reduction and rounding order. | A static Metal lowering matches four values per thread, SIMD reductions, precise divide/rsqrt, variance FMA and separate affine multiply/add. Keep original epsilon, gamma and beta. |
+| **Preserve BF16 GELU constants and expression order** | Promoting the whole activation to FP32 changed the constants; rounding every internal step also differed from native MPS. | Use BF16-rounded constants (`0.796875`, `0.044677734375`), native expression order in FP32, then explicit BF16 output rounding. |
+| **Preserve native RMSNorm power and inverse square root** | Squaring through multiplication differed from native MPS power; reciprocal square root also differed before BF16 rounding. | Use precise Metal power on the absolute input, with exponent two supplied at runtime, and precise division by the square root. Pad/slice only elementwise steps; reductions see the original sequence. |
+| **Materialize selected BF16 boundaries across the decoder** | A dtype label did not establish when values actually rounded. Norm-only controls left one answer different even with exact vision features. | Extend selected cast/add/sub/mul/activation boundaries across prefill and decode. Use integer-bit Metal nearest-even rounding for vision and bounded dynamic language shapes; slice away elementwise padding before downstream operators. |
+| **Control cached QK accumulation (experimental)** | At positions decode step 3, one attention score crossed a BF16 rounding threshold; FP32 GEMM alone still differed. | Use a balanced 64-term FP32 Metal dot, prevent reassociation/contraction, then round the score to BF16. Slice extra dispatch columns before softmax. The actual layer and final 44-case full-answer/token gate pass; random probes still show rare MPS differences. |
+| **Cover both matrix projection operators** | The earlier conversion rule handled only matrix multiplication without bias; vision used 72 projections with bias, which it missed. | Handle both: BF16 operands/bias → FP32 GEMM including bias → BF16 result. Preserve dynamic decoder shape constraints. This alone did not restore the differing outputs. |
+| **Match native batching and generation** | Earlier exports simplified crops/masks or invoked vision and connector once per crop. | Preserve original 13/17-crop batches/order/masks, equivalent position calculation, embedding lookup, image-token merge, causal attention, growing KV, greedy selection and EOS. |
+| **Preserve source values** | IO conversion and graph relocation needed safeguards. | Lossless BF16 interchange, cloned source graphs and separate original/controlled assets; unchanged learned values/dtypes. |
+
+These conversion rules preserve the original learned layers and weights.
+Vision uses native normalization and activation arithmetic; the language decoder
+uses explicit BF16 rounding, native RMSNorm primitives and controlled cached-QK
+accumulation, while retaining dynamic prefill/decode lengths.
+
+### What controlled experiments showed
+
+| Check | Finding |
+| --- | --- |
+| Native LayerNorm | The actual-input probe matched all 196,608 output elements; separate FP32 mean/inverse-std probes also matched. Generic normalization was insufficient. |
+| Native GELU | The corrected Core AI formula matched all 131,072 actual-input elements; ordinary FP32 GELU matched about 52.7%. |
+| Vision features | Exact at zero tolerance on the two saved full-batch fixtures (13 and 17 crops), plus positions and pair-below diagnostic inputs. This is a limited input sample. |
+| Language RMSNorm | Exact on an actual 1,143-token input and lengths 1/2/7/31/64 after both primitive repairs. |
+| Independent prefill / early decode | Positions and pair-right prefill logits exact. Positions full K/V exact across all 30 layers/all positions at prefill and after decode step 2. Limited prompts and steps. |
+| Cached-attention repair | At positions decode step 3, layer 21 `Q × Kᵀ` differed in 1 of 10,314 scores: native `29.25`, Core AI `29.125`. The balanced short-dot restores the layer hidden/KV outputs and the full 14-token positions caption. |
+| Positions / pair-right captions | Repaired vision restored both original full captions/tokens with the earlier language assets held fixed. |
+| Pair-below VQA | Exact vision plus norm-only/FP32-GEMM decoder still answered “On the left.”; broader decoder controls restored the reference “Right.”. Both are wrong against ground truth. |
+
+Earlier broader and stage-specific decoder controls still failed at least one
+caption. The new RMSNorm candidate keeps the original decoder graph and weights;
+the balanced-QK candidate restores all three original differing full answers/tokens.
+The full frozen 44-case gate then confirmed identical answers and complete token IDs.
+
+## Actions to verify the complete model
+
+1. **Freeze the reference and 44 questions.** Pin checkpoint, BF16 MPS, eager
+   attention, image hashes, prompts, greedy generation and token budget.
+2. **Run independent complete engines.** Each engine produces its own features
+   and KV. Common-input component probes are diagnostics, not accepted mixed runs.
+3. **Locate the first divergence.** Compare inputs, features, connector/merged
+   embeddings and logits under the same token prefix. Inspect token rankings;
+   after prefixes differ, subsequent logits are no longer directly comparable.
+4. **Audit values and controls.** Verify original learned tensors/dtypes,
+   constants and dynamic ranges. Test normalization, GELU, rounding, masks and KV
+   separately from the 44-question model evaluation.
+5. **Require answer and full-token identity.** Reject any paired answer or
+   token-sequence difference, even when task scores or caption quality agree.
+6. **Keep only complete zero-exit runs.** Use a fresh runtime per question for
+   the unresolved texture-cache crash, preserve failures and retain the earliest
+   complete successful attempt regardless of answer quality. Isolation does not
+   fix service reliability.
+
+## Accuracy summary
+
+The frozen set contains **31 VQA questions and 13 captions**, mostly synthetic.
+Both engines used one pass, max 32 new tokens and zero warmup. Core AI used
+recorded GPU preference and a fresh runtime per question. All **44 retained
+inference processes exited zero**, with no truncation or observed regression.
+Component checks are separate from these 44 evaluation questions.
+
+| Check | PyTorch BF16 MPS | Repaired Core AI |
+| --- | --- | --- |
+| VQA correct | 27/31 (87.1%) | 27/31 (87.1%); no per-case regression |
+| Caption text identical to reference | Reference | 13/13 |
+| Answer and full token-sequence identity | Reference | 44/44 |
+| Original three differing cases | Reference outputs | All complete answers/tokens restored |
+| Strict output gate | Reference | PASS on the frozen 44 questions |
+
+Matching answers can share the baseline's mistakes. Neither a 44-case output
+match nor the limited exact component probes establish tensor equality for every
+input, general natural-image accuracy or repeated-run stability.
+
+## Performance benchmark — repaired Core AI
+
+These measurements use the same repaired model that passed the frozen 44-case
+answer/token gate. Core AI retains the GPU preference used for accuracy validation;
+this preference does not establish exclusive GPU placement.
+
+The performance run used three cases: a red-circle color question, a red-circle
+caption and a two-cat caption.
+Each engine ran sequentially with a fresh process per case, **one warmup followed
+by one measured pass**, max 32 new tokens, and component instrumentation.
+Warmup and measurement shared the same process; model loading/warmup were excluded
+from request latency. Both engines generated the same 3/10/14 tokens, including EOS.
+
+Red cells mark where Core AI trails PyTorch: higher latency or lower throughput.
+
+| Metric | PyTorch BF16 MPS | Repaired Core AI |
+| --- | ---: | ---: |
+| Preprocessing, request median | 105.22 ms | <span className="benchmark-gap">133.55 ms</span> |
+| Vision, request median | 1,276.26 ms | <span className="benchmark-gap">1,441.32 ms</span> |
+| Connector, request median | 4.25 ms | <span className="benchmark-gap">12.16 ms</span> |
+| Text embedding, request median | 0.25 ms | <span className="benchmark-gap">2.58 ms</span> |
+| Image-token merge, request median | 3.18 ms | 0.09 ms |
+| Language prefill + LM head, request median | 179.37 ms | <span className="benchmark-gap">368.02 ms</span> |
+| End-to-end TTFT, request median | 1,588.60 ms | <span className="benchmark-gap">1,971.81 ms</span> |
+| Complete request, median | 1,668.94 ms | <span className="benchmark-gap">2,277.95 ms</span> |
+| Cached decode step, median | 30.82 ms | <span className="benchmark-gap">56.56 ms</span> |
+| Cached decode step, mean | 31.09 ms | <span className="benchmark-gap">57.16 ms</span> |
+| Decode elapsed / total steps | 31.17 ms | <span className="benchmark-gap">57.16 ms</span> |
+| Aggregate cached-decode throughput | 32.08 tokens/s | <span className="benchmark-gap">17.50 tokens/s</span> |
+
+There were **24 cached-decode steps** per engine. Throughput is total cached
+tokens divided by total decode elapsed seconds, not the reciprocal of the median.
+Elapsed time includes final stopping overhead, explaining its small difference
+from the mean measured step. Stage medians need not add to the request median.
+
+Vision remained the largest first-token cost. Repaired Core AI vision was
+about 13% slower, prefill took about 2.1 times as long, and the median decode step
+1.8 times as long as PyTorch's. All three answers and complete token
+sequences matched, and all six processes exited normally without retries.
+
+Maximum sampled process RSS was 0.868 GiB for PyTorch and 3.090 GiB for Core AI,
+including loading/warmup. PyTorch separately reported a 4.133 GiB MPS driver peak;
+Core AI device counters were unavailable. RSS alone is not a total-device-memory
+comparison. Checkpoint versus deployment assets were 513.03 MB versus 516.98 MB;
+disk size is not runtime RAM.
+
+## Next steps to improve performance
+
+1. **Use this warmed comparison as the performance baseline.** The repaired
+   model is now measured. Repeat the short benchmark to confirm variation before
+   accepting small speedups; three cases and one measured pass are exploratory.
+   Track first-token latency, decode time, throughput and memory after each change.
+2. **Trace where time goes.** Separate kernel execution, host/device transfers,
+   compilation and synchronization in vision, prefill and decode. Inspect actual
+   hardware placement before choosing which operations to optimize.
+3. **Reduce cached-decode overhead.** Investigate keeping KV on the device and
+   updating only new entries, instead of handing the full growing cache through
+   the host each step. Measure how much of the decode gap this explains.
+4. **Reduce first-token cost.** Prioritize the vision encoder, the largest stage
+   in this benchmark. Investigate redundant transfers, padding and temporary
+   tensors while preserving native crop batching and BF16 rounding boundaries.
+5. **Measure the cost of precision controls.** Change one control at a time and
+   compare accuracy and speed. Keep replacements only if they preserve the fixed
+   output checks. Evaluate lower-precision or quantized variants separately, with
+   an explicit accuracy target.
+
+After each change, rerun the same 44 questions and compare complete answers and
+full token sequences with the frozen reference. Use repeated warmed runs to
+confirm speedups, and test sustained inference to check the unresolved runtime crash.
+
+</div>

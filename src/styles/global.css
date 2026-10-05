@@ -109,6 +109,11 @@ table {
 .compact-report p {
 	margin: 0 0 1.15rem;
 }
+.compact-report td:has(.benchmark-gap) {
+	color: #991b1b;
+	background: #fee2e2;
+	font-weight: 700;
+}
 .compact-report h2 {
 	margin-top: 1.8rem;
 }
