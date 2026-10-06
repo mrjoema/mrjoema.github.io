@@ -73,22 +73,34 @@ The full frozen 44-case gate then confirmed identical answers and complete token
 
 ## Actions to verify the complete model
 
-1. **Freeze the reference and 44 questions.** Pin checkpoint, BF16 MPS, eager
-   attention, image hashes, prompts, greedy generation and token budget.
-2. **Run independent complete engines.** Each engine produces its own features
-   and KV. Common-input component probes are diagnostics, not accepted mixed runs.
-3. **Locate the first divergence.** Compare inputs, features, connector/merged
-   embeddings and logits under the same token prefix. Inspect token rankings;
-   after prefixes differ, subsequent logits are no longer directly comparable.
-4. **Audit values and controls.** Verify original learned tensors/dtypes,
-   constants and dynamic ranges. Test normalization, GELU, rounding, masks and KV
-   separately from the 44-question model evaluation.
-5. **Require answer and full-token identity.** Reject any paired answer or
-   token-sequence difference, even when task scores or caption quality agree.
-6. **Keep only complete zero-exit runs.** Use a fresh runtime per question for
-   the unresolved texture-cache crash, preserve failures and retain the earliest
-   complete successful attempt regardless of answer quality. Isolation does not
-   fix service reliability.
+1. **Freeze the comparison.** Keep the checkpoint, 44 questions, image hashes,
+   BF16 MPS reference, eager attention, prompts and generation settings fixed.
+2. **Diagnose numerical differences.** Use the tensor metrics below to compare
+   intermediate outputs under the same token prefix and locate the first divergence.
+3. **Validate complete outputs.** Run both engines independently, each producing
+   its own features and KV. Retain only normally completed runs and require
+   identical answers and full token sequences across all 44 questions.
+
+### Tensor metrics used during verification
+
+I compared **output tensors**—image features, hidden states, logits and KV—with
+PyTorch outputs. Learned weight preservation was audited separately. Let $p_i$
+be a PyTorch reference value, $c_i$ the corresponding Core AI value, and $N$ the
+number of elements in the compared tensor.
+
+| Metric | Definition | Purpose |
+| --- | --- | --- |
+| **MAE: mean absolute error** | $\frac{1}{N}\sum_{i=1}^{N}\lvert c_i-p_i\rvert$ | Summarize average numerical drift. |
+| **Maximum absolute error** | $\max_i\lvert c_i-p_i\rvert$ | Find the worst individual difference that an average can hide. |
+| **RMSE: root mean squared error** | $\sqrt{\frac{1}{N}\sum_{i=1}^{N}(c_i-p_i)^2}$ | Additional vision diagnostic, giving larger errors more weight. MSE was not recorded separately. |
+| **Exact element fraction** | Fraction of values equal to the reference | Check zero-tolerance equality in component/trace probes. |
+| **Cosine similarity** | Compare the directions of flattened output tensors | Diagnose overall feature agreement; near-one similarity does not prove equal values. |
+
+**MAE was a diagnostic, not the sole pass condition.** Component checks used
+per-element absolute/relative tolerances, plus cosine similarity for vision;
+zero-tolerance probes required every element to match. The final 44-question
+acceptance check required identical complete answers and token sequences,
+not a small average tensor error.
 
 ## Accuracy summary
 
