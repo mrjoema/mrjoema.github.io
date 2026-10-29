@@ -1,0 +1,562 @@
+---
+title: 'Optimizing DETR person detection: what each GPU optimization actually does'
+description: 'A hands-on review of the core inference-optimization concepts: profiling first, BatchNorm folding, fp16, channels-last, kernel fusion, torch.compile, TensorRT, quality gates, and Amdahl-style reality checks.'
+pubDate: '2026-10-28'
+type: 'experiment'
+tags: ['detr', 'pytorch', 'torch-compile', 'tensorrt', 'onnx', 'gpu-profiling', 'optimization']
+---
+
+This post uses one concrete exercise to review the concepts that matter in GPU inference optimization. The numbers are real, but they are there to support the ideas, not to be a lab notebook. Numbers come from my benchmark notes unless marked **(inferred)** or **(computed)**.
+
+**The task.** Run `facebook/detr-resnet-50` over video chunks, sample 2 frames per second, and produce one "person score" per frame. Consecutive frames above a threshold become person-present intervals.
+
+## TL;DR
+
+**Where the bottleneck is.**
+
+| Level | Finding |
+|---|---|
+| Pipeline | CPU preprocessing takes **83%** of the time per frame. The model takes only **12%**. |
+| Inside the model | It is **memory-bound, not compute-bound**. Elementwise ops (`add`, `mul`, `relu_`) use about **47%** of GPU time, more than convolutions (25%). |
+
+**Priority 1: preprocessing, the real bottleneck (section 3a).**
+
+| Step | What it does | Why |
+|---|---|---|
+| 1. Move preprocess from CPU to GPU | Upload raw uint8 BGR once per batch, then BGR to RGB, resize and normalize as tensor ops on the GPU | The Hugging Face processor on CPU cost 41.1 ms / frame. uint8 is also 4x fewer bytes than float32 over the bus |
+| 2. Keep antialiasing on the GPU resize | `F.interpolate(..., antialias=True)` | PIL's downscale is anti-aliased. Without it, scores drift from the reference |
+| 3. Keep postprocess on the GPU | Softmax and argmax on the GPU, one transfer back to the CPU | Avoids one transfer per frame |
+
+I did not measure the end-to-end gain from the preprocessing change in this post, so I quote no speedup for it.
+
+**Priority 2: the model (profile, fold BN, fp16, channels-last, compile, TensorRT).**
+
+| Step | What it does | Result |
+|---|---|---|
+| 1. Profile first | Find the memory-bound pointwise ops | Dictates the steps below |
+| 2. Fold BatchNorm into conv | Removes the BN `mul` / `add` kernels, **exact** | Fewer kernels |
+| 3. fp16 + channels-last | Halves bytes per tensor, matches the layout tensor cores want | **1.95x** over fp32 eager (362 vs 185 fps) |
+| 4. `torch.compile(max-autotune)` | Fuses the remaining pointwise ops | **5.7x** in total; launches fell 8496 to 1452 |
+| 5. Direct TensorRT fp16 | Its own fusion and kernel selection | **7.6x** |
+| 6. Quality gate on every variant | Compare with fp32 outputs | Caught ONNX Runtime's TensorRT provider: fast, but **wrong outputs** |
+
+The speedup is not faster kernels. It is **fewer kernels**: about 72% of the saved time was memory-bound pointwise ops.
+
+**Model-only optimization bought about 1.1x end to end**, because preprocessing dominates. I profiled, found the model was not the bottleneck, optimized it anyway because it was well defined, and then quantified the end-to-end cap with Amdahl's law.
+
+## 1. Measure before optimizing
+
+```text
+decode (OpenCV) -> preprocess (HF processor, CPU) -> model (DETR, GPU) -> postprocess -> intervals
+```
+
+Baseline, batch 8:
+
+| Stage | ms / frame | Share |
+|---|---|---|
+| preprocess (CPU, Hugging Face processor) | 41.1 | **83%** |
+| model (GPU forward) | 6.0 | 12% |
+| decode | 2.0 | 4% |
+| postprocess | 0.45 | 1% |
+
+**Amdahl's law** gives the ceiling: `49.55 / (49.55 - 6.04) = 1.14x`. An infinitely fast model speeds the pipeline up by only 14%.
+
+### Timing GPU code correctly
+
+CUDA launches are asynchronous. Without synchronization you time the launch, not the kernel.
+
+```python
+@contextmanager
+def timed(stats, name):
+    torch.cuda.synchronize()          # drain earlier work, or it leaks into this stage
+    t0 = time.perf_counter()
+    yield
+    torch.cuda.synchronize()          # wait for this stage's kernels
+    stats[name].append(time.perf_counter() - t0)
+```
+
+Also use warmup passes (compile and autotune costs land there) and report a median.
+
+### The baseline code
+
+This is the real baseline from `02_inference.ipynb`. Decode turns each sampled frame into a PIL RGB image, and `infer_batch` runs the three timed stages.
+
+```python
+def infer_batch(images, stats):
+    with timed(stats, "preprocess"):
+        inputs = processor(images=images, return_tensors="pt").to(device)   # CPU: PIL resize + numpy normalize
+    with timed(stats, "model"), torch.no_grad():
+        out = model(**inputs)                                                # fp32, NCHW, eager
+    with timed(stats, "postprocess"):
+        sizes = torch.tensor([im.size[::-1] for im in images]).to(device)
+        res = processor.post_process_object_detection(out, threshold=0.0, target_sizes=sizes)
+        scores = []
+        for r in res:
+            mask = r["labels"] == PERSON_ID
+            scores.append(r["scores"][mask].max().item() if mask.any() else 0.0)   # a GPU sync per frame
+    return scores
+
+
+def person_scores(path, stats, batch_size=BATCH):
+    cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = max(1, round(fps / SAMPLE_FPS))
+    times, scores, batch, batch_t = [], [], [], []
+    idx = 0
+    while True:
+        t0 = time.perf_counter()
+        if not cap.grab():
+            break
+        if idx % step == 0:
+            ok, frame = cap.retrieve()
+            if ok:
+                batch.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+                batch_t.append(idx / fps)
+        stats["decode"].append(time.perf_counter() - t0)
+        if len(batch) == batch_size:
+            scores += infer_batch(batch, stats)
+            times += batch_t
+            batch, batch_t = [], []
+        idx += 1
+    if batch:
+        scores += infer_batch(batch, stats)          # the last batch can be short
+        times += batch_t
+    cap.release()
+    return times, scores, step / fps
+```
+
+## 2. Profile the model: memory-bound, not compute-bound
+
+`torch.profiler` on the fp32 eager model (self CUDA time):
+
+| Op | Share | Calls |
+|---|---|---|
+| `cudnn_convolution` | 25.4% | 54 |
+| `aten::add` | 17.2% | 180 |
+| `aten::mul` | 13.6% | 189 |
+| `aten::addmm` (linear) | 9.0% | 97 |
+| `aten::relu_` | 8.6% | 49 |
+
+**Elementwise ops (`add`, `mul`, `relu_`) were about 47% of GPU time, more than convolutions.** These ops do almost no math. Each one reads a whole activation tensor from memory and writes it back, so their time is set by memory bandwidth, not FLOPs. The 49 `relu_` calls match ResNet-50's 49 ReLUs, and the `mul` / `add` calls are **(inferred)** to be DETR's frozen BatchNorm.
+
+That profile dictates the optimization list: remove the BN ops, shrink the bytes, and fuse what remains.
+
+## 3. The optimizations, one concept at a time
+
+Every step below shows the code before and after. The "before" snippets are the plain fp32 eager baseline path.
+
+### 3a. Preprocess on the GPU (the 83%)
+
+Preprocessing was the biggest stage, so it leads this section. It is ordered by what the profile says to fix first. Its GPU version is written, but its end-to-end result is not measured here.
+
+The baseline runs the Hugging Face image processor on the CPU: PIL resize and numpy normalize, one frame at a time, in float32. The processor's default is a shortest edge of 800 px (longest edge capped at 1333), so a 480p frame is upscaled before the model **(inferred from the default config)**. The GPU version uploads **raw uint8** (1 byte per value instead of 4) and does BGR to RGB, resize and normalize as tensor ops. It still asks the Hugging Face processor, once per input shape, what size it would resize to, so the model input matches the baseline.
+
+```python
+# Before (02_inference.ipynb): CPU. PIL images in, a float32 tensor out, then a copy to the GPU
+inputs = processor(images=images, return_tensors="pt").to(device)          # 41.1 ms / frame
+```
+
+```python
+# After (person_detector.py): GPU. One uint8 upload per batch, everything else is a tensor op
+def _resize_target(self, height, width):
+    key = (height, width)
+    if key not in self._target_hw:
+        blank = Image.fromarray(np.zeros((height, width, 3), dtype=np.uint8))
+        pixels = self._processor(images=[blank], return_tensors="pt")["pixel_values"]
+        self._target_hw[key] = tuple(pixels.shape[-2:])                    # size the HF processor would pick
+    return self._target_hw[key]
+
+def _preprocess(self, batch):
+    x = torch.from_numpy(np.stack(batch)).to(self._device)                 # raw uint8 BGR
+    x = x.permute(0, 3, 1, 2).flip(1).float()                              # NHWC -> NCHW, BGR -> RGB
+    target = self._resize_target(*batch[0].shape[:2])
+    if tuple(x.shape[-2:]) != target:
+        # antialias=True matches PIL when shrinking; without it large downscales alias and scores drift
+        x = F.interpolate(x, size=target, mode="bilinear", align_corners=False, antialias=True)
+        x = x.round().clamp(0, 255)                                        # PIL rounds to uint8 after resize
+    x = (x / 255.0 - self._mean) / self._std                               # same normalization as the HF processor
+    layout = torch.channels_last if self._channels_last else torch.contiguous_format
+    return x.to(self._input_dtype).contiguous(memory_format=layout)
+```
+
+**`antialias=True` matters.** PIL's downscale is anti-aliased. A plain bilinear `F.interpolate` is not, so without the flag the pixels differ from the reference preprocessing and the scores drift. The quality gate in section 5 is what tells you whether the GPU path still matches.
+
+Postprocess follows the same idea: do the reduction on the GPU and cross the bus once.
+
+```python
+# Before (02_inference.ipynb): HF post-processing, then a .item() (GPU sync) for every frame
+res = processor.post_process_object_detection(out, threshold=0.0, target_sizes=sizes)
+scores = []
+for r in res:
+    mask = r["labels"] == PERSON_ID
+    scores.append(r["scores"][mask].max().item() if mask.any() else 0.0)
+
+# After (person_detector.py): reduce on the GPU, one transfer per batch
+logits = self._forward(self._preprocess(batch))
+prob = logits.float().softmax(-1)[..., :-1]                                # drop the no-object class
+top_score, top_label = prob.max(-1)
+person = torch.where(top_label == self._person_id, top_score, torch.zeros_like(top_score))
+return person.max(dim=1).values.cpu().tolist()                             # one transfer, not one per frame
+```
+
+### 3b. Fold BatchNorm into the convolution
+
+In eval mode BatchNorm is a fixed per-channel affine transform. A conv followed by an affine transform is just a conv with rescaled filters and a new bias. The two elementwise ops disappear and the result is **exact**, not approximate.
+
+```python
+# Before: conv -> BN, two extra memory-bound kernels
+y = conv(x)
+y = (y - mean) * weight / sqrt(var + eps) + bias
+
+# After: one conv
+scale = bn.weight * (bn.running_var + eps).rsqrt()           # per-output-channel multiplier
+fused.weight.copy_(conv.weight * scale.view(-1, 1, 1, 1))    # scale each output channel's filters
+fused.bias.copy_((bias - bn.running_mean) * scale + bn.bias)
+```
+
+```python
+# Before (baseline): 53 conv + frozen-BN pairs; each BN runs as separate mul / add kernels
+model = DetrForObjectDetection.from_pretrained(MODEL_DIR).eval().to(device)
+
+# After (torch_detector.py): fold each pair into one conv, in place
+logger.info("Folded %d conv + BatchNorm pairs", fold_frozen_bn(model))
+```
+
+<details>
+<summary>Full code: <code>_fold</code> and <code>fold_frozen_bn</code></summary>
+
+```python
+def _is_bn(module):
+    return isinstance(module, nn.BatchNorm2d) or type(module).__name__.endswith("FrozenBatchNorm2d")
+
+
+def _fold(conv, bn):
+    # Exact only in eval mode, where BatchNorm uses its running statistics.
+    eps = getattr(bn, "eps", 1e-5)
+    scale = bn.weight * (bn.running_var + eps).rsqrt()
+    fused = nn.Conv2d(conv.in_channels, conv.out_channels, conv.kernel_size, conv.stride,
+                      conv.padding, conv.dilation, conv.groups, bias=True).to(conv.weight.device)
+    bias = conv.bias if conv.bias is not None else torch.zeros_like(bn.running_mean)
+    with torch.no_grad():
+        fused.weight.copy_(conv.weight * scale.view(-1, 1, 1, 1))
+        fused.bias.copy_((bias - bn.running_mean) * scale + bn.bias)
+    return fused
+
+
+def fold_frozen_bn(model):
+    """Fold each conv + frozen BatchNorm pair into one conv, in place. Returns the pair count."""
+    pairs = []
+    for parent in model.modules():
+        kids = dict(parent.named_children())
+        for name, child in kids.items():
+            if isinstance(child, nn.Conv2d) and name.startswith("conv"):
+                bn_name = "bn" + name[len("conv"):]
+                if bn_name in kids and _is_bn(kids[bn_name]):
+                    pairs.append((parent, name, bn_name))
+        if (isinstance(parent, nn.Sequential) and len(parent) == 2
+                and isinstance(parent[0], nn.Conv2d) and _is_bn(parent[1])):
+            pairs.append((parent, "0", "1"))
+    for parent, conv_name, bn_name in pairs:
+        parent._modules[conv_name] = _fold(parent._modules[conv_name], parent._modules[bn_name])
+        parent._modules[bn_name] = nn.Identity()
+    if not pairs:
+        raise RuntimeError("No conv + BatchNorm pairs found to fold")
+    return len(pairs)
+```
+
+</details>
+
+Practical notes: DETR uses `DetrFrozenBatchNorm2d`, so match on the class name as well as `nn.BatchNorm2d`. Replace the BN with `nn.Identity()` rather than deleting it. Raise if zero pairs were folded, so a library rename fails loudly instead of silently skipping the optimization. ResNet-50 has 53 conv+BN pairs.
+
+### 3c. fp16: half the bytes
+
+Because the workload is memory-bound, halving bytes per tensor directly cuts time. fp16 also unlocks tensor cores.
+
+```python
+# Before (baseline): fp32 weights, fp32 input
+model = DetrForObjectDetection.from_pretrained(MODEL_DIR).eval().to(device)
+
+# After (torch_detector.py): cast the weights once, and cast the preprocessed input to the same dtype
+model = model.to(self.config.dtype)                                    # torch.float16
+x = x.to(self._input_dtype)                                            # last line of _preprocess
+```
+
+### 3d. Channels-last: match the layout tensor cores want
+
+**Tensors carry strides, not just a shape.** The same logical `(N, C, H, W)` tensor can be laid out in memory two ways:
+
+```python
+x = torch.zeros(1, 3, 4, 4)
+x.stride()                                                   # (48, 16, 4, 1)  W is contiguous: NCHW
+y = x.contiguous(memory_format=torch.channels_last)
+y.shape, y.stride()                                          # same shape, (48, 1, 12, 3)  C is contiguous: NHWC
+```
+
+Sort the dimensions by stride, largest to smallest, and you get the physical order. The dimension with stride 1 is the innermost one.
+
+**Why tensor cores prefer NHWC.** A convolution runs as an *implicit GEMM*: output pixels are the rows (`M`), output channels are the columns (`N`), and the reduction runs over `C*R*S` (`K`). A GEMM (general matrix multiply, `C = A @ B`) is the operation tensor cores implement in hardware, on small tiles. The `K` dimension of the activation matrix is the input channel.
+
+```cuda
+// NHWC: channels are contiguous, so one thread loads 8 fp16 channels (16 bytes) in one instruction
+int4 v = *(int4*)&input[((n*H + h)*W + w)*C + c0];
+
+// NCHW: channels are H*W elements apart, so the K dimension becomes a strided gather
+for (int i = 0; i < 8; ++i)
+    a[i] = input[((n*C + c0 + i)*H + h)*W + w];
+```
+
+**The tensor core does not detect or fix anything.** It only multiplies tiles in registers. The decision is made on the CPU: PyTorch and cuDNN look at the tensor's shape, strides and dtype, then pick a kernel. Given NCHW, cuDNN either launches a slower kernel or wraps the conv in layout transposes (`nchwToNhwcKernel` / `nhwcToNchwKernel` in a profile). Those do no math and are pure memory traffic.
+
+**Why convert once, at the start.** Most CNN ops (BN, ReLU, add, pooling, conv) preserve the memory format of their input. Set it on the input and the weights, and it propagates, so you pay one conversion instead of a transpose pair at every conv.
+
+```python
+# Before (baseline): nothing set, weights and input stay NCHW, so cuDNN wraps the convs in layout transposes
+
+# After (torch_detector.py + person_detector.py): convert the weights once, and the input in _preprocess
+model = model.to(memory_format=torch.channels_last)
+layout = torch.channels_last if self._channels_last else torch.contiguous_format
+x = x.to(self._input_dtype).contiguous(memory_format=layout)
+```
+
+In this pipeline, frames arrive from OpenCV as NHWC. `permute(0, 3, 1, 2)` only relabels strides, so the data is already channels-last in memory. Calling `.flip(1)` allocates a new tensor and re-lays it out, so check with `x.is_contiguous(memory_format=torch.channels_last)` before assuming it survived.
+
+fp16 + channels-last + folded BN, still eager: **362 fps, 1.95x** over the 185 fps baseline.
+
+### 3e. Kernel fusion and torch.compile
+
+Fusion is the key concept for the "why". Take BN scale, add bias, add residual, ReLU:
+
+```python
+# Eager: 4 kernels. Each reads its whole input and writes its whole output (T = tensor size)
+#   x*scale: 2T,  +bias: 2T,  +res: 3T,  relu: 2T   ->  about 9T of memory traffic
+y = x * scale; y = y + bias; y = y + res; y = torch.relu(y)
+
+# Fused: one kernel reads x and res once, keeps intermediates in registers, writes once -> about 3T
+@triton.jit
+def fused(x_ptr, res_ptr, scale_ptr, bias_ptr, out_ptr, n, C, HW, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    res = tl.load(res_ptr + offs, mask=mask)
+    c = (offs // HW) % C
+    y = x * tl.load(scale_ptr + c, mask=mask) + tl.load(bias_ptr + c, mask=mask) + res
+    tl.store(out_ptr + offs, tl.maximum(y, 0.0), mask=mask)
+```
+
+Pointwise ops do almost no arithmetic, so their time follows memory traffic. Cutting 9T to 3T is the whole trick. `torch.compile` (Inductor) generates this automatically. In a profile you see it as kernel names: `triton_poi_fused_add_relu` (pointwise), `triton_tem_fused_add_convolution_relu` (ReLU fused into the conv epilogue), `triton_tem_fused__softmax_bmm` (softmax fused into the attention matmul).
+
+```python
+# Before (baseline): eager, one kernel launch per op
+out = model(**inputs)
+
+# After (torch_detector.py): Inductor fuses the pointwise chains into Triton kernels
+if self.config.compile_mode:                                           # "max-autotune"
+    model = torch.compile(model, mode=self.config.compile_mode)
+```
+
+| Mode | What it does | fps (batch 8) |
+|---|---|---|
+| none (eager) | one launch per op | 362 |
+| `default` | fuses pointwise and reductions | 811 |
+| `max-autotune` | default + benchmarks Triton conv / matmul tiles against cuDNN / cuBLAS | **958** |
+| `reduce-overhead` | adds CUDA graphs | 836 |
+
+Two more concepts show up here:
+
+- **CUDA graphs add nothing.** A CUDA graph records a sequence of kernels once and replays it with a single launch, which removes per-kernel CPU launch overhead (roughly 5-10 us each). That only helps when the GPU sits idle waiting for the CPU to launch the next kernel. Here the GPU was already about 95% busy and each kernel ran long enough to hide the launch cost, so there was nothing to save. The negative result is itself a finding: launch overhead is not the bottleneck.
+- **Compiled graphs are specialized to one input shape.** A new batch size recompiles (about 176 s cold for `max-autotune` at batch 16). So the detector pads the last batch to the fixed size and drops the padded scores, rather than sending a short batch.
+
+**The model steps together.** `torch_detector.py` makes them config switches. The fp32 eager reference turns every switch off, and the defaults are the winning variant. (The reference still uses the GPU preprocess from the base class. The CPU baseline is in `02_inference.ipynb`.)
+
+```python
+# Before: the fp32 eager reference
+REFERENCE_CONFIG = TorchConfig(batch_size=8, dtype=torch.float32, channels_last=False,
+                               fold_bn=False, compile_mode=None)
+
+# After: the defaults are the winner (batch_size defaults to 16 in DetectorConfig)
+@dataclass(frozen=True)
+class TorchConfig(DetectorConfig):
+    dtype: torch.dtype = torch.float16
+    channels_last: bool = True
+    fold_bn: bool = True
+    compile_mode: Optional[str] = "max-autotune"
+
+def _build_model(self):
+    model = DetrForObjectDetection.from_pretrained(self.config.model_id).eval()
+    model = model.to(self._device)
+    if self.config.fold_bn:
+        logger.info("Folded %d conv + BatchNorm pairs", fold_frozen_bn(model))
+    if self.config.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    model = model.to(self.config.dtype)
+    if self.config.compile_mode:
+        model = torch.compile(model, mode=self.config.compile_mode)
+    return model
+
+def _forward(self, x):
+    return self._model(pixel_values=x).logits
+```
+
+### 3f. Batching
+
+```python
+# Before (02_inference.ipynb): flush at batch_size, then one short batch at the end (a new input shape)
+if len(batch) == batch_size:
+    scores += infer_batch(batch, stats)
+...
+if batch:
+    scores += infer_batch(batch, stats)
+
+# After (person_detector.py): always send full batches, padding the last one with its final frame
+size = self.config.batch_size
+for start in range(0, len(frames_bgr), size):
+    batch = list(frames_bgr[start : start + size])
+    real = len(batch)
+    batch += [batch[-1]] * (size - real)                 # a short batch would recompile (torch) or not match the engine
+    scores += self._score_batch(batch)[:real]            # drop the padded scores
+```
+
+Batch 1 to 4 costs the same forward-pass time (about 26 ms), so per-frame cost drops about 4x: at batch 1 the GPU is mostly idle **(inferred, not verified)**. After batch 4 the forward pass grows almost linearly, so the GPU is saturated and more batch only costs memory. With the optimized model, batch 16 beat 8 by about 10%, and 32 added nothing.
+
+### 3g. TensorRT
+
+TensorRT does its own graph optimization, layer fusion and kernel selection. Pipeline: PyTorch model, then ONNX export at a fixed shape, then a TensorRT engine, then run on PyTorch's CUDA stream.
+
+```python
+# Before (torch_detector.py): PyTorch forward
+def _forward(self, x):
+    return self._model(pixel_values=x).logits
+
+# After (tensorrt_detector.py), step 1: export to ONNX at a fixed shape, logits only
+class _LogitsOnly(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, pixel_values):
+        return self.model(pixel_values=pixel_values).logits
+
+dummy = torch.randn(config.batch_size, 3, *hw, device="cuda")
+torch.onnx.export(_LogitsOnly(model).eval(), dummy, path, input_names=["pixel_values"],
+                  output_names=["logits"], opset_version=17)
+
+# After, step 2: build a TensorRT engine
+# Build once per (GPU model, TensorRT version, batch, H x W). Takes minutes, so cache the plan.
+network = builder.create_network(0)
+parser.parse_from_file(onnx_path)                    # check the return value and parser errors
+config.set_flag(trt.BuilderFlag.FP16)                # allow fp16 kernels; engine I/O stays fp32
+plan = builder.build_serialized_network(network, config)
+
+# After, step 3: run. Bind PyTorch tensors by address, launch on torch's current stream.
+context.set_tensor_address("pixel_values", x.data_ptr())
+context.set_tensor_address("logits", out.data_ptr())
+context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+```
+
+Running on `torch.cuda.current_stream()` orders the engine with the surrounding torch ops, so no extra synchronization is needed. The trade-offs:
+
+- An engine is only valid for one GPU model, TensorRT version, batch size and input size. Put all of those in the cache key.
+- The first build takes minutes, and a new frame size needs a new engine.
+- The execution context is not thread-safe: one detector per thread.
+
+## 4. Proving where the speedup came from
+
+Profile of baseline vs the PyTorch winner on the same 64 frames:
+
+| Per frame | fp32 eager (b8) | max-autotune (b16) | Ratio |
+|---|---|---|---|
+| Wall ms | 5.47 | 0.96 | 5.7x |
+| Kernel launches | 132.8 | 22.7 | 5.9x |
+| GPU busy | 95% | 94% | |
+
+| Where the saving came from | Share |
+|---|---|
+| Pointwise ops (BN, ReLU, add) | about 72% |
+| Conv + gemm + templates | about 25% |
+| Other + memcpy | about 4% |
+
+**The sentence to remember:** the average kernel took about 39 us before and 40 us after. The speedup is *fewer* kernels, not *faster* kernels. The baseline was memory-bound on pointwise ops, and fusion removed them.
+
+## 5. The quality gate
+
+A faster wrong answer is not a speedup. Every variant is compared with the fp32 baseline on the same frames.
+
+```python
+flag_agreement = ((base >= THRESHOLD) == (new >= THRESHOLD)).mean()
+gate = "pass" if flag_agreement >= 0.99 and interval_iou >= 0.95 else "FAIL"
+```
+
+A `FAIL` row's speedup does not count. This measures drift from fp32, not accuracy against ground truth.
+
+### The gate catches a real bug: ONNX Runtime + TensorRT
+
+ONNX Runtime's TensorRT execution provider hit 1267 fps, nearly as fast as direct TensorRT, but the gate said **FAIL**: agreement 0.929, IoU 0.878, 4 of 7 person segments missed. I isolated it by changing one variable at a time:
+
+| Check | Result | What it ruled out |
+|---|---|---|
+| fp32 through the same provider | Same failure | Not a precision problem |
+| Same ONNX, ORT CUDA provider | Matches PyTorch | The ONNX export is fine |
+| Same ONNX, TensorRT built directly | **Pass** | The model and the engine are fine |
+| Error pattern | Spread over every batch and position | Not a padding or indexing bug |
+
+The fault sits in the ORT TensorRT provider path (graph partitioning and hand-off). I did not isolate the exact cause inside the provider, so that is as far as the claim goes.
+
+Two smaller lessons:
+
+- **Raw `logit diff` is not a pass / fail signal.** It is the max over all queries and classes, so outliers dominate. Use a task-level gate.
+- **ORT can silently fall back.** If it cannot load the TensorRT libraries it quietly drops to the CUDA provider. Assert on `sess.get_providers()` so a slow run fails loudly.
+
+## 6. The end-to-end reality check
+
+- 5.7x on the 12% model share is about **1.1x end to end** with preprocessing unchanged (computed, not measured).
+- TensorRT's extra gain over the PyTorch variant is about 0.4% of the original-quality pipeline (computed, not measured).
+- On original-quality input, decode and preprocess are even larger, and the model is about 9% of the total.
+
+So the right priority order is preprocess, then decode, then overlap, then model. I did the model first because it was the cleanest, most measurable piece.
+
+### The final shape of the code
+
+```python
+class PersonDetector(ABC):
+    @abstractmethod
+    def _forward(self, x): ...                  # backend-specific: PyTorch or TensorRT
+
+    def _preprocess(self, batch):                         # all on the GPU
+        x = torch.from_numpy(np.stack(batch)).to("cuda")  # raw uint8 BGR, one upload per batch
+        x = x.permute(0, 3, 1, 2).flip(1).float()         # NHWC -> NCHW, BGR -> RGB
+        x = F.interpolate(x, size=target, mode="bilinear",
+                          align_corners=False, antialias=True)
+        x = x.round().clamp(0, 255)
+        x = (x / 255.0 - self._mean) / self._std
+        return x.to(self._input_dtype).contiguous(memory_format=layout)
+
+    @torch.no_grad()
+    def _score_batch(self, batch):                        # postprocess stays on the GPU
+        logits = self._forward(self._preprocess(batch))
+        prob = logits.float().softmax(-1)[..., :-1]
+        top_score, top_label = prob.max(-1)
+        person = torch.where(top_label == self._person_id, top_score,
+                             torch.zeros_like(top_score))
+        return person.max(dim=1).values.cpu().tolist()    # one transfer, not one per frame
+```
+
+## 7. Questions worth answering
+
+- *Why is BN folding exact?* In eval mode BN uses fixed running statistics, so it is a per-channel affine map. Composing it with a conv gives a conv with scaled filters and a new bias.
+- *Why was the model faster if kernels did not get faster?* The workload was memory-bound pointwise ops. Fusion cuts memory traffic (about 9T to 3T in the example) and launch count (8496 to 1452).
+- *Why does channels-last help?* The implicit-GEMM reduction runs over channels, so NHWC makes that dimension contiguous and loadable with wide vector loads. With NCHW, cuDNN adds transposes around each conv.
+- *Why did CUDA graphs not help?* Launch overhead was not the bottleneck; the GPU was already about 95% busy.
+- *Why does batch size stop helping?* Past batch 4 the forward pass grows almost linearly, so the GPU is saturated.
+- *How did you know the ORT result was wrong and not the model?* The quality gate failed, then elimination: fp32 still failed, the same ONNX passed on the ORT CUDA provider and on TensorRT built directly.
+- *If the model is only 12%, why optimize it?* It was well defined and measurable, and it becomes the larger share once the other stages shrink. The honest answer is that preprocessing should have come first.
+
+## Profiling snippet to reuse
+
+```python
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    run_pass(runner, batches, stats)
+    torch.cuda.synchronize()
+kernels = [e for e in prof.key_averages()
+           if e.device_type == torch.autograd.DeviceType.CUDA]   # GPU kernels only
+prof.export_chrome_trace("trace.json")                            # open in ui.perfetto.dev
+```
