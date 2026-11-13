@@ -1,0 +1,191 @@
+---
+// Before -> after per item on one axis: a gray dot for before, the accent for after.
+import './viz.css';
+import { ACCENT, CONTEXT } from './color';
+
+interface Row {
+	label: string;
+	sub?: string;
+	before: number;
+	after: number;
+}
+interface Props {
+	title: string;
+	subtitle?: string;
+	caption?: string;
+	rows: Row[];
+	max: number;
+	ticks: number[];
+	unit?: string;
+	decimals?: number;
+	axisLabel?: string;
+	beforeLabel?: string;
+	afterLabel?: string;
+}
+
+const {
+	title,
+	subtitle,
+	caption,
+	rows,
+	max,
+	ticks,
+	unit = 's',
+	decimals = 1,
+	axisLabel,
+	beforeLabel = 'Before',
+	afterLabel = 'After',
+} = Astro.props;
+
+const BEFORE = CONTEXT[0];
+const fmt = (v: number) => v.toFixed(decimals);
+const withUnit = (v: number) => `${fmt(v)} ${unit}`;
+const pct = (v: number) => (v / max) * 100;
+const change = (r: Row) => {
+	const p = ((r.after - r.before) / r.before) * 100;
+	return `${p > 0 ? '+' : '−'}${Math.abs(p).toFixed(0)}%`;
+};
+---
+
+<figure class="viz-chart">
+	<p class="viz-title">{title}</p>
+	{subtitle && <p class="viz-subtitle">{subtitle}</p>}
+	<ul class="viz-legend">
+		<li><i class="viz-swatch is-dot" style={`background:${BEFORE}`} />{beforeLabel}</li>
+		<li><i class="viz-swatch is-dot" style={`background:${ACCENT}`} />{afterLabel}</li>
+	</ul>
+	<div class="viz-scroll">
+		<div class="viz-canvas" role="group" aria-label={title}>
+			{
+				rows.map((row) => {
+					const lo = Math.min(row.before, row.after);
+					const hi = Math.max(row.before, row.after);
+					return (
+						<div class="viz-row">
+							<div class="viz-label">
+								<span>{row.label}</span>
+								{row.sub && <span class="viz-sub">{row.sub}</span>}
+							</div>
+							<div class="viz-plot">
+								{ticks.map((t) => (
+									<i class:list={['viz-grid', { 'is-base': t === 0 }]} style={`left:${pct(t)}%`} />
+								))}
+								<i class="link" style={`left:${pct(lo)}%;width:${pct(hi) - pct(lo)}%`} />
+								<span
+									class="dot"
+									tabindex="0"
+									style={`left:${pct(row.before)}%;--fill:${BEFORE}`}
+									data-value={withUnit(row.before)}
+									data-label={`${beforeLabel} · ${row.label}`}
+									data-color={BEFORE}
+								/>
+								<span
+									class="dot"
+									tabindex="0"
+									style={`left:${pct(row.after)}%;--fill:${ACCENT}`}
+									data-value={withUnit(row.after)}
+									data-label={`${afterLabel} · ${row.label}`}
+									data-color={ACCENT}
+								/>
+							</div>
+							<div class="viz-total">
+								{fmt(row.before)} → {fmt(row.after)} {unit}
+								<span class="viz-sub">{change(row)}</span>
+							</div>
+						</div>
+					);
+				})
+			}
+			<div class="viz-row viz-axis" aria-hidden="true">
+				<span />
+				<div class="viz-plot">
+					{ticks.map((t) => (
+						<span class="viz-tick" style={`left:${pct(t)}%`}>
+							{t}
+						</span>
+					))}
+				</div>
+				<span />
+			</div>
+			{axisLabel && <p class="viz-axis-label">{axisLabel}</p>}
+		</div>
+	</div>
+	<details class="viz-table">
+		<summary>Table view</summary>
+		<table>
+			<thead>
+				<tr>
+					<th />
+					<th>{beforeLabel}</th>
+					<th>{afterLabel}</th>
+					<th>Change</th>
+				</tr>
+			</thead>
+			<tbody>
+				{
+					rows.map((row) => (
+						<tr>
+							<td>
+								{row.label}
+								{row.sub && ` (${row.sub})`}
+							</td>
+							<td>{withUnit(row.before)}</td>
+							<td>{withUnit(row.after)}</td>
+							<td>{change(row)}</td>
+						</tr>
+					))
+				}
+			</tbody>
+		</table>
+	</details>
+	{caption && <figcaption>{caption}</figcaption>}
+	<div class="viz-tip" hidden>
+		<i class="viz-tip-key"></i>
+		<strong class="viz-tip-value"></strong>
+		<span class="viz-tip-label"></span>
+	</div>
+</figure>
+
+<script>
+	import { bindTooltips } from './tooltip';
+	bindTooltips();
+</script>
+
+<style>
+	.link {
+		position: absolute;
+		top: 50%;
+		height: 2px;
+		margin-top: -1px;
+		background: var(--viz-base);
+		border-radius: 1px;
+	}
+	/* 24px hit target around a 12px dot with a 2px surface ring. */
+	.dot {
+		position: absolute;
+		top: 50%;
+		z-index: 1;
+		width: 24px;
+		height: 24px;
+		margin: -12px 0 0 -12px;
+		border-radius: 50%;
+		outline: none;
+	}
+	.dot::after {
+		content: '';
+		position: absolute;
+		inset: 6px;
+		border-radius: 50%;
+		background: var(--fill);
+		box-shadow: 0 0 0 2px var(--viz-surface);
+	}
+	.dot:hover::after,
+	.dot.is-active::after {
+		filter: brightness(1.12);
+		inset: 5px;
+	}
+	.dot:focus-visible::after {
+		outline: 2px solid var(--viz-ink);
+		outline-offset: 2px;
+	}
+</style>

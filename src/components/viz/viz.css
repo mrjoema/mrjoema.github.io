@@ -1,0 +1,200 @@
+/* Shared chart chrome for src/components/viz. Light mode only, like the rest of the site. */
+.viz-chart {
+	--viz-surface: #fcfcfb;
+	--viz-ink: #0b0b0b;
+	--viz-ink-2: #52514e;
+	--viz-muted: #898781;
+	--viz-grid: #e1e0d9;
+	--viz-base: #c3c2b7;
+	--viz-border: rgba(11, 11, 11, 0.1);
+	position: relative;
+	margin: 1.5rem 0 1.75rem;
+	padding: 1rem 1.1rem 0.85rem;
+	border: 1px solid var(--viz-border);
+	border-radius: 8px;
+	background: var(--viz-surface);
+	color: var(--viz-ink-2);
+	text-align: left;
+	line-height: 1.35;
+}
+.viz-chart .viz-title {
+	margin: 0;
+	color: var(--viz-ink);
+	font-size: 0.95rem;
+	font-weight: 600;
+}
+.viz-chart .viz-subtitle {
+	margin: 0.15rem 0 0;
+	font-size: 0.8rem;
+}
+.viz-legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.35rem 1rem;
+	margin: 0.7rem 0 0;
+	padding: 0;
+	list-style: none;
+	font-size: 0.78rem;
+}
+.viz-legend li {
+	display: flex;
+	align-items: center;
+	gap: 0.4rem;
+	margin: 0;
+}
+.viz-swatch {
+	width: 12px;
+	height: 12px;
+	border-radius: 3px;
+}
+.viz-swatch.is-dot {
+	border-radius: 50%;
+}
+.viz-scroll {
+	overflow-x: auto;
+	-webkit-overflow-scrolling: touch;
+	margin-top: 0.6rem;
+}
+.viz-canvas {
+	min-width: 720px;
+}
+.viz-row {
+	display: grid;
+	grid-template-columns: 11rem minmax(0, 1fr) 8.5rem;
+	column-gap: 0.75rem;
+	align-items: center;
+}
+.viz-label {
+	display: flex;
+	flex-direction: column;
+	color: var(--viz-ink);
+	font-size: 0.8rem;
+}
+.viz-sub {
+	color: var(--viz-muted);
+	font-size: 0.7rem;
+}
+.viz-plot {
+	position: relative;
+	height: 40px;
+}
+.viz-grid {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	width: 1px;
+	background: var(--viz-grid);
+}
+.viz-grid.is-base {
+	background: var(--viz-base);
+}
+.viz-ref {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	width: 1px;
+	background: var(--viz-ink-2);
+	z-index: 2;
+}
+.viz-total {
+	color: var(--viz-ink);
+	font-size: 0.8rem;
+	font-variant-numeric: tabular-nums;
+}
+.viz-total .viz-sub {
+	display: block;
+}
+.viz-annot .viz-plot,
+.viz-axis .viz-plot {
+	height: 1.25rem;
+}
+.viz-ref-label,
+.viz-tick {
+	position: absolute;
+	white-space: nowrap;
+	font-size: 0.7rem;
+	font-variant-numeric: tabular-nums;
+}
+.viz-ref-label {
+	bottom: 0.15rem;
+	color: var(--viz-ink-2);
+}
+.viz-tick {
+	top: 0.2rem;
+	color: var(--viz-muted);
+	transform: translateX(-50%);
+}
+.viz-chart .viz-axis-label {
+	margin: 0.1rem 0 0;
+	color: var(--viz-muted);
+	font-size: 0.7rem;
+	text-align: center;
+}
+.viz-table {
+	margin-top: 0.6rem;
+	font-size: 0.78rem;
+}
+.viz-table summary {
+	cursor: pointer;
+	color: var(--viz-ink-2);
+}
+.viz-table table {
+	margin: 0.5rem 0 0;
+	font-size: 0.78rem;
+	font-variant-numeric: tabular-nums;
+}
+.viz-chart figcaption {
+	margin-top: 0.5rem;
+	color: var(--viz-ink-2);
+	font-size: 0.78rem;
+	text-align: left;
+}
+.viz-tip {
+	position: absolute;
+	z-index: 10;
+	display: flex;
+	align-items: center;
+	gap: 0.45rem;
+	padding: 0.35rem 0.55rem;
+	border: 1px solid var(--viz-border);
+	border-radius: 6px;
+	background: #ffffff;
+	box-shadow: 0 4px 14px rgba(11, 11, 11, 0.12);
+	color: var(--viz-ink-2);
+	font-size: 0.75rem;
+	white-space: nowrap;
+	pointer-events: none;
+	transform: translate(-50%, calc(-100% - 6px));
+}
+.viz-tip[hidden] {
+	display: none;
+}
+.viz-tip-key {
+	width: 12px;
+	height: 2px;
+	border-radius: 1px;
+}
+.viz-tip-value {
+	color: var(--viz-ink);
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+}
+/* Group heading: one setup's rows sit under it, indented. */
+.viz-group {
+	display: flex;
+	align-items: baseline;
+	gap: 0.6rem;
+	margin-top: 0.6rem;
+	padding-top: 0.55rem;
+	border-top: 1px solid var(--viz-grid);
+	color: var(--viz-ink);
+	font-size: 0.82rem;
+}
+.viz-group.is-first {
+	margin-top: 0.2rem;
+	padding-top: 0;
+	border-top: 0;
+}
+.viz-row.in-group .viz-label {
+	padding-left: 0.75rem;
+}

@@ -1,0 +1,259 @@
+---
+// Horizontal stacked bars on one axis. One series gives plain bars (no legend box);
+// per-row `colors` overrides give the emphasis form (one row in the accent, the rest gray).
+import './viz.css';
+import { textOn } from './color';
+
+interface Series {
+	key: string;
+	label: string;
+	color: string;
+}
+interface Row {
+	// Rows that share a group (for example the stages of one setup) get one heading above them.
+	group?: string;
+	groupNote?: string;
+	label: string;
+	sub?: string;
+	values: Record<string, number>;
+	total?: string;
+	totalSub?: string;
+	colors?: Record<string, string>;
+}
+interface Props {
+	title: string;
+	subtitle?: string;
+	caption?: string;
+	series: Series[];
+	rows: Row[];
+	max: number;
+	ticks: number[];
+	unit?: string;
+	decimals?: number;
+	axisLabel?: string;
+	refLine?: { value: number; label: string };
+}
+
+const { title, subtitle, caption, series, rows, max, ticks, unit = 's', decimals = 1, axisLabel, refLine } =
+	Astro.props;
+
+// Plot width at the canvas's min-width, used only to decide whether a value fits inside its segment.
+const PLOT_PX = 360;
+const CHAR_PX = 6.5;
+const PAD_PX = 12;
+
+const fmt = (v: number) => v.toFixed(decimals);
+const withUnit = (v: number) => `${fmt(v)} ${unit}`;
+const pct = (v: number) => (v / max) * 100;
+
+const bars = rows.map((row) => {
+	const segs = series
+		.map((s) => ({ ...s, color: row.colors?.[s.key] ?? s.color, value: row.values[s.key] ?? 0 }))
+		.filter((s) => s.value > 0);
+	const sum = segs.reduce((acc, s) => acc + s.value, 0);
+	return {
+		...row,
+		totalText: row.total ?? withUnit(sum),
+		segs: segs.map((s, i) => {
+			const text = fmt(s.value);
+			return {
+				...s,
+				text,
+				width: pct(s.value),
+				// One series: the total column already labels the bar, so no inline value.
+				fits: series.length > 1 && text.length * CHAR_PX + PAD_PX <= (pct(s.value) / 100) * PLOT_PX,
+				ink: textOn(s.color),
+				first: i === 0,
+				last: i === segs.length - 1,
+				tip: series.length > 1 ? `${s.label} · ${row.label}` : row.label,
+			};
+		}),
+	};
+});
+const refPct = refLine ? pct(refLine.value) : 0;
+---
+
+<figure class="viz-chart">
+	<p class="viz-title">{title}</p>
+	{subtitle && <p class="viz-subtitle">{subtitle}</p>}
+	{
+		series.length > 1 && (
+			<ul class="viz-legend">
+				{series.map((s) => (
+					<li>
+						<i class="viz-swatch" style={`background:${s.color}`} />
+						{s.label}
+					</li>
+				))}
+			</ul>
+		)
+	}
+	<div class="viz-scroll">
+		<div class="viz-canvas" role="group" aria-label={title}>
+			{
+				refLine && (
+					<div class="viz-row viz-annot" aria-hidden="true">
+						<span />
+						<div class="viz-plot">
+							<span
+								class="viz-ref-label"
+								style={refPct > 60 ? `right:${100 - refPct}%;margin-right:4px` : `left:${refPct}%;margin-left:4px`}
+							>
+								{refLine.label}
+							</span>
+						</div>
+						<span />
+					</div>
+				)
+			}
+			{
+				bars.map((row, i) => (
+					<Fragment>
+					{row.group && row.group !== bars[i - 1]?.group && (
+						<div class:list={['viz-group', { 'is-first': i === 0 }]}>
+							<strong>{row.group}</strong>
+							{row.groupNote && <span class="viz-sub">{row.groupNote}</span>}
+						</div>
+					)}
+					<div class:list={['viz-row', { 'in-group': row.group }]}>
+						<div class="viz-label">
+							<span>{row.label}</span>
+							{row.sub && <span class="viz-sub">{row.sub}</span>}
+						</div>
+						<div class="viz-plot">
+							{ticks.map((t) => (
+								<i class:list={['viz-grid', { 'is-base': t === 0 }]} style={`left:${pct(t)}%`} />
+							))}
+							{refLine && <i class="viz-ref" style={`left:${refPct}%`} />}
+							<div class="bar">
+								{row.segs.map((s) => (
+									<span
+										class="seg"
+										tabindex="0"
+										style={`width:${s.width}%`}
+										data-value={withUnit(s.value)}
+										data-label={s.tip}
+										data-color={s.color}
+									>
+										<span
+											class:list={['paint', { gap: !s.first, end: s.last }]}
+											style={`background:${s.color};color:${s.ink}`}
+										>
+											{s.fits && s.text}
+										</span>
+									</span>
+								))}
+							</div>
+						</div>
+						<div class="viz-total">
+							{row.totalText}
+							{row.totalSub && <span class="viz-sub">{row.totalSub}</span>}
+						</div>
+					</div>
+					</Fragment>
+				))
+			}
+			<div class="viz-row viz-axis" aria-hidden="true">
+				<span />
+				<div class="viz-plot">
+					{ticks.map((t) => (
+						<span class="viz-tick" style={`left:${pct(t)}%`}>
+							{t}
+						</span>
+					))}
+				</div>
+				<span />
+			</div>
+			{axisLabel && <p class="viz-axis-label">{axisLabel}</p>}
+		</div>
+	</div>
+	<details class="viz-table">
+		<summary>Table view</summary>
+		<table>
+			<thead>
+				<tr>
+					<th />
+					{series.length > 1 && series.map((s) => <th>{s.label}</th>)}
+					<th>{series.length > 1 ? 'Total' : title}</th>
+				</tr>
+			</thead>
+			<tbody>
+				{
+					bars.map((row) => (
+						<tr>
+							<td>
+								{row.group && `${row.group} · `}
+								{row.label}
+								{row.sub && ` (${row.sub})`}
+							</td>
+							{series.length > 1 &&
+								series.map((s) => <td>{row.values[s.key] ? withUnit(row.values[s.key]) : '–'}</td>)}
+							<td>
+								{row.totalText}
+								{row.totalSub && ` (${row.totalSub})`}
+							</td>
+						</tr>
+					))
+				}
+			</tbody>
+		</table>
+	</details>
+	{caption && <figcaption>{caption}</figcaption>}
+	<div class="viz-tip" hidden>
+		<i class="viz-tip-key"></i>
+		<strong class="viz-tip-value"></strong>
+		<span class="viz-tip-label"></span>
+	</div>
+</figure>
+
+<script>
+	import { bindTooltips } from './tooltip';
+	bindTooltips();
+</script>
+
+<style>
+	.bar {
+		position: relative;
+		z-index: 1;
+		display: flex;
+		height: 100%;
+	}
+	/* The hit target is the full row height; the painted bar is 20px. */
+	.seg {
+		display: flex;
+		align-items: center;
+		height: 100%;
+		outline: none;
+		cursor: default;
+	}
+	.paint {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 100%;
+		height: 20px;
+		overflow: visible;
+		font-size: 0.72rem;
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+		white-space: nowrap;
+	}
+	/* 2px surface gap between touching segments, never a stroke. */
+	.paint.gap {
+		box-shadow: inset 2px 0 0 var(--viz-surface);
+		padding-left: 2px;
+	}
+	/* Rounded data-end, square at the baseline. */
+	.paint.end {
+		border-radius: 0 4px 4px 0;
+	}
+	.seg:hover .paint,
+	.seg:focus-visible .paint,
+	.seg.is-active .paint {
+		filter: brightness(1.12);
+	}
+	.seg:focus-visible .paint {
+		outline: 2px solid var(--viz-ink);
+		outline-offset: 1px;
+	}
+</style>
