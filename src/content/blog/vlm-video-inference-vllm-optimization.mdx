@@ -14,7 +14,7 @@ import { STAGE, ACCENT, CONTEXT } from '../../components/viz/color';
 
 **Setup.** vLLM 0.31, one engine with tensor parallelism 2 (TP=2) on H100s, greedy decoding. 300 frames become 306,000 video tokens, about **307,830 prompt tokens per request**. Most runs used an 8-GPU H100 node. The very first baseline ran on an older 4-GPU host, and I say so where it matters.
 
-**Quality.** There are no labels yet. "Same answer" means identical greedy output text against the reference run. A different answer is not necessarily a worse one. Numbers are measured unless marked **(estimate)** or **(inferred)**.
+**Quality.** There are no labels yet. "Same answer" means identical greedy output text against the reference run. A different answer is not necessarily a worse one.
 
 ## TL;DR
 
@@ -31,7 +31,7 @@ import { STAGE, ACCENT, CONTEXT } from '../../components/viz/color';
 | 2 | torch.compile | `enforce_eager=False`, no CUDA graphs | Unfused elementwise ops in the prefill | Prefill 32.8 → 28.5 s; batch 6 1.24 → 1.41 videos/min |
 | 3 | Shared prefill for both passes | One engine, video before text, prefix cache on | The second pass recomputed the whole video | Second-pass engine time 31.1 → 2.0 s when the cache hits |
 
-All of it assumes **several requests in flight per engine**, which the baseline had too. That is what lets the CPU and GPU work overlap (section 2).
+All the throughput runs submit **several requests at once per engine**, in the baseline too (section 2).
 
 <StackedBars
   title="Throughput at batch 6, one TP=2 engine, each change on top of the last"
@@ -46,7 +46,6 @@ All of it assumes **several requests in flight per engine**, which the baseline 
   decimals={2}
   max={1.8}
   ticks={[0, 0.4, 0.8, 1.2, 1.6]}
-  refLine={{ value: 1.6, label: 'GPU ceiling after compile ≈ 1.6 (estimate)' }}
   axisLabel="Videos per minute"
   caption="Change 3 works per recording across two passes, so it shows up in the end-to-end run instead. The baseline ran on the old 4-GPU host and the other rows on the 8-GPU host."
 />
@@ -60,8 +59,8 @@ All of it assumes **several requests in flight per engine**, which the baseline 
 
 - **The biggest win was an environment variable, not a kernel.**
 - **Every fix moved the bottleneck.** First the CPU front end was the limit, then the GPU. A change helps only if it shortens the stage that limits throughput at that moment.
-- **vLLM still decodes the video.** The next video is decoded while the GPU works on the current one, so the 17 s of decode costs no throughput.
-- **The two-pass reuse is mostly unrealized.** The prefix cache hit for 1 of 5 timestamp requests, because the next recording's prefill evicted the rest. If all five had hit, the run would take about 370 s **(estimate)**.
+- **vLLM still decodes the video.** I did not build a separate decode stage.
+- **The two-pass reuse is mostly unrealized.** The prefix cache hit for only 1 of 5 timestamp requests in the end-to-end run (section 6).
 - **Quality is open.** Changes 1 and 2 leave the answers unchanged in the runs I compared. Change 3 reorders the prompt, and the end-to-end answers differ from the baseline. That still needs the eval set.
 
 ## The final config
@@ -79,7 +78,7 @@ OPTIMIZED = Preset(
         "enforce_eager": False,
         "compilation_config": {"cudagraph_mode": "NONE"},
         # The startup JIT warmup builds a FlashInfer sampling kernel with ninja, which failed
-        # on our image; greedy sampling does not use that kernel.
+        # on our image. The runs use greedy sampling (temperature 0).
         "kernel_config": {"enable_jit_warmup": False},
         # 3. Without it the timestamp pass recomputes the whole video.
         "enable_prefix_caching": True,
@@ -89,12 +88,13 @@ OPTIMIZED = Preset(
 )
 ```
 
-Everything else stays at vLLM's defaults, and vLLM decodes the video file itself. Before this goes to production:
+Everything else stays at vLLM's defaults, and vLLM decodes the video file itself.
 
-- **Keep requests in flight.** The production stage submits one request at a time by default, which removes the overlap that section 2 depends on.
-- **Check that the TP workers get the variable.** Under Ray's executor, they are separate actors. vLLM's log should say "OMP_NUM_THREADS=8 is set; leaving Torch threads at 8". Also check whether Ray already sets `OMP_NUM_THREADS` itself.
-- **Plan for the cold start.** A cold compile cache adds about 60 s to each engine start (section 4).
-- **Add the cache-safe scheduling.** Change 3 only pays off if the next recording's request is held back until the current recording's timestamp request has started; otherwise its prefill evicts the cached video (section 6).
+**Not verified yet:**
+
+- Production's batch size defaults to 1, and I did not check how many requests `ray.data.llm` keeps in flight. Every throughput number here comes from benchmarks that submit several at once.
+- Whether the TP workers get `OMP_NUM_THREADS` under Ray's executor, and whether Ray already sets it. My runs used vLLM's own multiprocessing backend.
+- Cache-safe scheduling for change 3: in the end-to-end run the cache hit for only 1 of 5 timestamp requests (section 6).
 
 ## 1. Profile: where the 87 seconds went
 
@@ -112,7 +112,7 @@ Each pair differs by one stage, so subtracting gives that stage:
 
 - **Video decode** = file front end − frames front end = **16.9 s**
 - **Vision encoder** = frames core − text core = **6.5 s**
-- **Prefill** = text core = **32.5 s**. Prefill cost depends on the number of tokens, not on whether they came from video, so same-length text does the same work.
+- **Prefill** = text core = **32.5 s**. This assumes prefill cost depends only on the token count, so same-length text does the same prefill work.
 
 <StackedBars
   title="Time to first token, split by stage"
@@ -143,29 +143,30 @@ Every video goes through two stages:
 - **CPU stage**, in vLLM's single front-end process: decode the video, run the HF processor, tokenize.
 - **GPU stage**, in the engine processes: vision encoder, prefill, then the answer.
 
-The KV cache holds 503,584 tokens per engine, and one 307k-token request takes 61% of it, so two requests cannot run on the GPU at once. "Batching" these requests does not mean a bigger GPU batch. It means **pipelining**: with several requests in flight, the front end prepares video N+1 while the GPU works on video N.
+The KV cache holds 503,584 tokens per engine, and one 307,830-token request takes 61% of it, so a second one does not fit beside the first. "Batching" these requests therefore does not mean a bigger GPU batch. What I varied is how many requests are in flight: with several outstanding, the front end can prepare the next video while the GPU works on the current one.
 
 ```text
 front end (CPU)   [ video 1 ][ video 2 ][ video 3 ] ...
 GPU                          [ video 1  ][ video 2  ][ video 3 ] ...
 
-throughput = 1 / max(CPU time per video, GPU time per video)
+model used below: throughput = 1 / max(CPU time per video, GPU time per video)
 ```
 
-Two consequences frame everything after this section:
+What I measured in the baseline (OMP unset, eager, vLLM decodes the video):
 
-1. **Requests must be in flight, or nothing overlaps.** In the baseline, 1 request at a time gives 0.66 videos/min and 6 at once give 1.09 (+65%), with GPU utilization going from 42% to 72%. That the gain is overlap is **(inferred)**, but the arithmetic below fits it.
-2. **Only the slower stage matters.** Shortening the faster stage changes nothing.
-
-The baseline, per video at batch 6:
-
-| Stage | Per video | |
+| | 1 request at a time | 6 requests at once |
 |---|---|---|
-| CPU | 48.2 s: decode 16.9 + processor 31.3 | **slower: sets the speed** |
-| GPU | ~42 s: encoder 6.5 + prefill 32.5 + answer ~3 **(estimate)** | waits ~6 s per video |
-| Check | 6 x 48.2 + ~42 ≈ 331 s predicted for 6 videos | **330.3 s measured** |
+| Throughput | 0.66 videos/min | 1.09 videos/min |
+| GPU busy | 42.0% | 71.7% |
 
-So the first target is the CPU stage, and inside it the processor.
+And the two stages, per video:
+
+| Stage | Per video |
+|---|---|
+| CPU | 48.2 s: decode 16.9 + processor 31.3 |
+| GPU | 39.0 s: encoder 6.5 + prefill 32.5 (answer decode not included) |
+
+The CPU stage is the longer one, and at batch 6 the 6 videos took 330.3 s (55.1 s per video). So the first target is the CPU stage, and inside it the processor.
 
 ## 3. Change 1: the HF video processor on 8 threads
 
@@ -216,10 +217,10 @@ with set_default_torch_num_threads():
 # and falls back to 1 when the variable is unset. It was unset.
 ```
 
-vLLM keeps torch single-threaded on purpose. Its own log warns that multi-threaded torch CPU ops can slow its busy-polling loops. But this processor is one big batch of tensor copies, and on one thread it took 26 s.
+vLLM's log with the variable unset says `Reducing Torch threads from 21 to 1`. With it set, the log says `OMP_NUM_THREADS=8 is set; leaving Torch threads at 8 for serving` and warns that multi-threaded torch CPU ops during serving can degrade performance through spin-wait contention. On one thread the processor took 26 s.
 
 <details>
-<summary>What the HF video processor does, and why it is memory-bound</summary>
+<summary>What the HF video processor does</summary>
 
 Input: 300 frames of 1080 x 1920 x 3 uint8 (1.87 GB). Output: `pixel_values_videos` of 1,224,000 x 1536 bf16 (3.8 GB) and `video_grid_thw = (150, 68, 120)`. No model weights are involved. It only rearranges and rescales pixels.
 
@@ -233,7 +234,7 @@ Input: 300 frames of 1080 x 1920 x 3 uint8 (1.87 GB). Output: `pixel_values_vide
 
 The patch arithmetic: 150 x 68 x 120 = 1,224,000 patches of 3 x 2 x 16 x 16 = 1536 values. The encoder merges 2 x 2 patches into one token, so 1,224,000 / 4 = **306,000 video tokens**.
 
-Every step allocates a new full-size tensor: 1.9 GB of uint8, float32 intermediates of about 7.5 GB each **(estimate from shapes)**, then 3.8 GB of bf16. The 9.3M page faults at 4 KB pages are about **36 GB of freshly touched memory**. That is why system CPU time (17 s, the kernel faulting pages in) is twice the user time (9 s). It is not DRAM-bandwidth bound: 36 GB in about 8 s is only 4.5 GB/s.
+On one thread, vLLM's call spent 17 s in system CPU time against 9 s in user time, with 9.3M minor page faults. At 4 KB per page, that is about 36 GB of memory touched for the first time.
 
 </details>
 
@@ -267,23 +268,20 @@ Sweep, with `OMP_NUM_THREADS` set in the front-end process after the engine star
 
 **8 threads is the efficient point**, with identical prompt tokens and answer text at every setting. Going to 16 or 43 threads saves only another 0.6 or 1.5 s, for 1.3x or 2.1x the CPU seconds.
 
-### What runs on the 8 threads
+### What the 8 threads are
 
-These are **8 threads, not 8 processes**. There is still one front-end process, and it still handles one video at a time. `OMP_NUM_THREADS` sets how many threads torch may use for a single operation: for a large tensor op, torch cuts the tensor into slices and each thread works on its own slice. The HF video processor is a chain of such ops on 1.87 GB of frames:
+These are **8 threads, not 8 processes**. There is still one front-end process, and it still handles one video at a time. `OMP_NUM_THREADS` sets how many threads torch may use inside a single operation. The processor's operations, with their time on one thread (cProfile; the rows overlap, so they do not add up):
 
-| Processor step | Time on 1 thread | On 8 threads? |
-|---|---|---|
-| Rescale + normalize (÷255, mean / std) | 8.1 s | Yes, each thread normalizes a slice of the pixels |
-| `torch.cat` (join groups) | 6.1 s | Yes, a parallel copy |
-| `.to` (float32 → bf16) | 5.7 s | Yes, a parallel conversion |
-| Patchify `reshape` (the one real copy) | 4.9 s | Yes, a parallel copy |
-| Bicubic resize | 2.8 s | Yes |
-| `contiguous` | 1.4 s | Yes |
-| `view`, `permute` | ~0 | Nothing to split: they copy no data |
+| Operation | Time on 1 thread |
+|---|---|
+| Rescale + normalize (÷255, mean / std) | 8.1 s |
+| `torch.cat` | 6.1 s |
+| `.to` (float32 → bf16) | 5.7 s |
+| Patchify `reshape` (the copy) | 4.9 s |
+| Bicubic resize | 2.8 s |
+| `contiguous` | 1.4 s |
 
-The rows overlap in the profile, so they do not add up. Only the processor's total was measured at 8 threads (26.4 → 9.5 s), not each op, so the last column is how torch handles ops of this size, not a per-op measurement.
-
-What stays on one thread: video decode (OpenCV, ~17 s; I did not measure whether the setting changes it), the tokenizer and the send to the engine core (~2.7 s), and about 7 s of the processor itself:
+Only the processor's total was measured at 8 threads (26.4 → 9.5 s), not each operation. I did not measure whether the setting changes video decode (OpenCV, ~17 s).
 
 <details>
 <summary>Why more threads stop helping: a two-term fit</summary>
@@ -300,15 +298,11 @@ That gives **P ≈ 19.3 s and S ≈ 7.1 s**. The two points left out of the fit 
 | 16 | 8.3 s | 8.9 s |
 | 43 | 7.6 s | 8.0 s |
 
-So about 7 s never shrinks, however many threads there are. The fit shows that a fixed part exists, not what it is. The candidates, none of them separated by a measurement yet:
-
-- single-threaded Python around the torch calls (about 1.3 s of the processor's own time);
-- small torch ops below the size cut-off for parallel work;
-- the kernel's page-fault and `munmap` paths, which serialize. The page-fault count is the same at every thread count, while system CPU seconds rise from 16.9 to 42.3 s as more threads fault at once.
+So the data is consistent with about 7 s that never shrinks, however many threads there are. The fit does not say what that part is, and I did not isolate it. What I did see: the page-fault count is the same at every thread count, while system CPU seconds rise from 16.9 s (1 thread) to 42.3 s (43 threads).
 
 </details>
 
-There are now two kinds of parallelism, and they are different things. The 8 threads work **inside** one video's processing. The pipeline from section 2 overlaps **across** processes: the front end on video N+1, the GPU on video N.
+Two different things are called parallel here. The 8 threads are **inside** one video's processing. Having several requests in flight (section 2) is **across** videos: the front end can work on video N+1 while the GPU works on video N.
 
 ### Applying it the way production would
 
@@ -321,17 +315,17 @@ In production the variable has to be in the environment **before** the engine st
 | 4 | 232.8 s, 1.03 | 210.2 s, 1.14 | 205.1 s, 1.17 |
 | 6 | 330.3 s, 1.09 | 296.6 s, 1.21 | **290.5 s, 1.24** |
 
-- **`before` costs nothing.** vLLM's log confirms that EngineCore and the workers kept 8 threads, and `before` is at least as fast as `after` at every batch size.
-- **Caveat:** `unset` and `after` ran on the old 4-GPU host and `before` on the 8-GPU host. The conclusion that `before` is not worse does not depend on that. The exact percentage does.
-- **The gain shrinks with batch size**, from -25% at batch 1 to -12% at batch 6, because the pipeline already hid part of the front end behind GPU work.
+- **`before` was not slower than `after`.** vLLM's log confirms that EngineCore and the workers kept 8 threads, and `before` was at least as fast as `after` at every batch size.
+- **Caveat:** `unset` and `after` ran on the old 4-GPU host and `before` on the 8-GPU host, so the exact percentages mix two hosts.
+- **The gain shrinks with batch size**: `unset` → `before` is -25% at batch 1 and -12% at batch 6.
 
-**Where this leaves the pipeline:** the CPU stage drops from 48.2 s to 28.8 s per video, below the GPU's ~42 s. **The GPU is now the limit**, so any further gain has to come from GPU time.
+**Where this leaves the pipeline:** the CPU stage drops from 48.2 s to 28.8 s per video, below the GPU stage's 39.0 s (encoder + prefill). **The GPU stage is now the longer one**, so the next target is GPU time.
 
 ## 4. Change 2: torch.compile
 
 | Setting | What it fixes | Result | Cost |
 |---|---|---|---|
-| `enforce_eager=False`, `cudagraph_mode="NONE"`, JIT warmup off | RMSNorm and other elementwise ops ran as tens of thousands of unfused kernels | Prefill 32.8 → 28.5 s; batch 6 1.24 → 1.41 videos/min; answer decode about 12.7 → 20.5 tokens/s **(inferred from the end-to-end run)** | +60 s on a cold engine start (about 11 videos to pay back); answers unchanged on the production path |
+| `enforce_eager=False`, `cudagraph_mode="NONE"`, JIT warmup off | RMSNorm and other elementwise ops ran as tens of thousands of unfused kernels | Prefill 32.8 → 28.5 s; batch 6 1.24 → 1.41 videos/min | +60 s on a cold engine start (about 11 videos to pay back); answers unchanged on the production path |
 
 ### Profile of one prefill
 
@@ -339,14 +333,14 @@ vLLM's torch profiler (CUDA kernels only) on both TP workers, for a same-length 
 
 | Category | GPU time | Share | Notes |
 |---|---|---|---|
-| Full attention (16 layers) | 13.81 s | 42.5% | FlashAttention-3, ~68% of peak **(estimate)** |
-| Matmul | 10.20 s | 31.4% | cuBLAS, ~73% of peak **(estimate)** |
+| Full attention (16 layers) | 13.81 s | 42.5% | FlashAttention-3 |
+| Matmul | 10.20 s | 31.4% | cuBLAS |
 | **Norm, activation, elementwise** | **6.07 s** | **18.7%** | **46,532 unfused PyTorch kernels** |
 | TP all-reduce | 1.75 s | 5.4% | NCCL ring, 2,451 calls |
 | Linear attention (48 layers) | 0.64 s | 2.0% | FlashInfer GDN kernels |
 | Idle between kernels | 0.23 s | 0.7% | ~12 ms per step, 19 steps |
 
-Attention and matmul already run near the hardware limit (the peak fractions are my FLOP estimates from the model config, not measured counters). The linear-attention layers are 48 of the 64 layers but only 2% of the time, and the gaps between kernels add up to 0.23 s. That leaves one obvious waste: **6.07 s of unfused elementwise ops**.
+Attention and matmul are a few large kernels each (FlashAttention-3, cuBLAS). The linear-attention layers are 48 of the 64 layers but only 2% of the time, and the gaps between kernels add up to 0.23 s. The one category made of tens of thousands of small kernels is the elementwise group: **6.07 s, 46,532 kernels**.
 
 The `pow` and `mean` kernels number exactly 2,451 = 129 x 19, one per RMSNorm (64 layers x 2 + the final norm) per prefill step. RMSNorm was running as separate `pow`, `mean`, multiply and cast kernels. That is what eager mode does: it runs the model one PyTorch op at a time, each op its own kernel, with torch.compile switched off. vLLM's log even listed fusions for these ops, but those fusions are torch.compile passes, so `enforce_eager=True` skips them.
 
@@ -364,7 +358,7 @@ engine_overrides = {
 }
 ```
 
-`cudagraph_mode="NONE"` keeps compilation without CUDA graph capture: the prefill gain comes from fusion alone. The JIT warmup is off because, with compilation on, vLLM builds a FlashInfer sampling kernel at startup, and that build failed on our image. Greedy sampling never uses that kernel.
+`cudagraph_mode="NONE"` keeps compilation without CUDA graph capture: the prefill gain comes from fusion alone. The JIT warmup is off because, with compilation on, vLLM builds a FlashInfer sampling kernel at startup, and that build failed on our image, so I turned the warmup off. The runs use greedy sampling (temperature 0).
 
 | Measure | `eager` | `compile` | Change |
 |---|---|---|---|
@@ -411,38 +405,29 @@ A cold start costs **+60 s**, and nothing is deferred to the first requests. Com
 ### Recap: how changes 1 and 2 moved the bottleneck
 
 <StackedBars
-  title="The pipeline after each change. In each setup the slower stage sets the throughput."
-  subtitle="Seconds per video, vLLM decodes the video. Built from single-request measurements."
+  title="The two stages after each change. The longer stage is the one to shorten next."
+  subtitle="Seconds per video, vLLM decodes the video. Built from single-request measurements; the GPU stage is encoder + prefill only, answer decode is not included."
   series={[
     { key: 'decode', label: 'Video decode', color: STAGE.decode },
     { key: 'frontEnd', label: 'Front end (HF processor, tokenizer)', color: STAGE.frontEnd },
     { key: 'encoder', label: 'Vision encoder', color: STAGE.encoder },
     { key: 'prefill', label: 'Prefill', color: STAGE.prefill },
-    { key: 'answer', label: 'Answer decode (~3 s, estimate)', color: STAGE.answer },
   ]}
   rows={[
-    { group: 'Baseline', groupNote: 'OMP unset, eager · the CPU stage is slower, so the GPU waits', label: 'CPU stage', sub: 'processor on 1 thread', values: { decode: 16.9, frontEnd: 31.3 }, totalSub: 'slower: sets the speed' },
-    { group: 'Baseline', label: 'GPU stage', sub: 'eager', values: { encoder: 6.5, prefill: 32.5, answer: 3 } },
-    { group: '+ change 1', groupNote: 'OMP_NUM_THREADS=8, still eager · now the GPU stage is slower', label: 'CPU stage', sub: 'processor on 8 threads', values: { decode: 16.9, frontEnd: 11.9 } },
-    { group: '+ change 1', label: 'GPU stage', sub: 'eager', values: { encoder: 6.2, prefill: 32.8, answer: 3 }, totalSub: 'slower: sets the speed' },
-    { group: '+ change 2 (final)', groupNote: 'OMP_NUM_THREADS=8, torch.compile · the GPU stage shrinks', label: 'CPU stage', sub: 'processor on 8 threads', values: { decode: 16.9, frontEnd: 11.9 } },
-    { group: '+ change 2 (final)', label: 'GPU stage', sub: 'torch.compile', values: { encoder: 6.1, prefill: 28.5, answer: 3 }, totalSub: 'slower: sets the speed' },
+    { group: 'Baseline', groupNote: 'OMP unset, eager · the CPU stage is the longer one', label: 'CPU stage', sub: 'processor on 1 thread', values: { decode: 16.9, frontEnd: 31.3 }, totalSub: 'longer stage' },
+    { group: 'Baseline', label: 'GPU stage', sub: 'eager', values: { encoder: 6.5, prefill: 32.5 }, totalSub: '' },
+    { group: '+ change 1', groupNote: 'OMP_NUM_THREADS=8, still eager · now the GPU stage is the longer one', label: 'CPU stage', sub: 'processor on 8 threads', values: { decode: 16.9, frontEnd: 11.9 } },
+    { group: '+ change 1', label: 'GPU stage', sub: 'eager', values: { encoder: 6.2, prefill: 32.8 }, totalSub: 'longer stage' },
+    { group: '+ change 2 (final)', groupNote: 'OMP_NUM_THREADS=8, torch.compile · the GPU stage gets shorter', label: 'CPU stage', sub: 'processor on 8 threads', values: { decode: 16.9, frontEnd: 11.9 } },
+    { group: '+ change 2 (final)', label: 'GPU stage', sub: 'torch.compile', values: { encoder: 6.1, prefill: 28.5 }, totalSub: 'longer stage' },
   ]}
   max={50}
   ticks={[0, 10, 20, 30, 40, 50]}
   axisLabel="Seconds per video"
-  caption="The answer decode is a lower bound: with full-length answers it was 4-10 s per request (section 6)."
+  caption="Measured batch-6 times for the three setups: 330.3 s, 290.5 s and 255.8 s."
 />
 
-The same model predicts the measured batch-6 times:
-
-| Setup | Predicted for 6 videos | Measured |
-|---|---|---|
-| Baseline (CPU-bound) | 6 x 48.2 + ~42 ≈ 331 s | 330.3 s |
-| + change 1 (GPU-bound) | ~29 + 6 x 42 ≈ 281 s | 290.3 s |
-| + change 2 (GPU-bound) | ~29 + 6 x 37.6 ≈ 254 s | 255.8 s |
-
-The middle row is 3% under, probably because the ~3 s answer decode is an underestimate. **Who decodes in the final config:** still vLLM. Decode is 17 s of the CPU stage, but the whole CPU stage (28.8 s) fits under the GPU's 37.6 s, so decode costs no throughput and there is no separate decode stage to build.
+In the final config vLLM still decodes the video file, so decode (16.9 s) is part of the CPU stage. I did not build a separate decode stage.
 
 ## 5. Change 3: one engine, video first, shared prefill
 
@@ -491,15 +476,13 @@ From reading vLLM 0.31's KV-cache manager, not traced in a run:
 
 There is no numerical comparison of K/V. Attention is causal, so identical preceding tokens give identical K/V, and a hash match is the whole test.
 
-Consequences:
+What this means for the two layouts:
 
 - **Text first breaks the chain in the first block.** The detect and timestamp prompts differ at the start, and every later block's hash depends on it, so the identical video after the text never matches.
-- **Reuse is per recording.** Two recordings of the same room differ in pixels, so their video identifiers differ.
-- **Eviction breaks the chain.** The cache holds about 1.5 videos. A different 307k-token request between the two passes evicts the oldest blocks of the first, and an exact repeat then gets 0 cached tokens.
 
 </details>
 
-The prompt change is small. One detail matters: the timestamp prompt lists the detected events, and the baseline builds that list from a Python `set`. A set's iteration order changes between processes, so the same events could produce different prompt text on each run. With the video first, that list sits after the shared prefix, so it cannot break the detect-to-timestamp hit. Sorting just makes the timestamp prompt identical from run to run, which keeps comparisons fair and lets a repeated request reuse the cache.
+The prompt change is small. One detail matters: the timestamp prompt lists the detected events, and the baseline builds that list from a Python `set`. A set's iteration order changes between processes, so the same events could produce different prompt text on each run. With the video first, that list sits after the shared prefix, so it cannot break the detect-to-timestamp hit. Sorting makes the timestamp prompt identical from run to run.
 
 ```python
 # optimized_engine.py
@@ -553,9 +536,9 @@ The last run put all three changes together, with real prompts and full-length a
 
 What the log shows:
 
-- **The pipeline flipped, as predicted.** In the baseline each request spends 40-46 s in the front end against 35-41 s of engine core, so the GPU waits. In the final config the front end takes 25-28 s against 31-36 s of engine core, and the engine is idle for 20 s of 478 s.
-- **The prefix cache hit only once.** Only the last recording's timestamp request hit, because nothing ran after it. For the others, the next recording's detect request started its prefill first and evicted part of the cached video. The multimodal processor cache also missed for those four. Its default is 4 GB, about one processed video **(inferred)**.
-- **Answer decode is not small.** I had assumed ~3 s per request from short test answers. With real prompts it was about 4 s per detect request and 10 s per timestamp request **(estimate from request timings)**. Compile sped this up too, from 12.7 to 20.5 tokens/s, because there are fewer kernels per token.
+- **The longer stage flipped.** In the baseline each request spends 40-46 s in the front end against 35-41 s of engine core, and the GPU was busy 72.7% of the time. In the final config the front end takes 25-28 s against 31-36 s of engine core, and the engine is idle for 20 s of 478 s.
+- **The prefix cache hit only once.** The last recording's timestamp request hit (307,328 of 307,601 tokens cached). The first four had 0 cached tokens. With 2 requests in flight, each of those four had the next recording's detect request ahead of it in the engine. The KV cache holds 483,791 tokens with prefix caching on. I did not isolate the cause. The multimodal processor cache also missed for those four.
+- **Answer decode is not small.** Summed over requests it was 178.0 s in the baseline and 105.2 s in the final config, against 482.3 s and 277.7 s of front end and 431.3 s and 352.8 s of engine core.
 - **The answers differ from baseline** for almost every recording, while the event counts are similar (42 against 42 in total). The final config changes the prompt layout as well as the engine, so this cannot yet be called a quality change in either direction.
 
 ## Key concepts, one line each
@@ -565,11 +548,11 @@ What the log shows:
 | TTFT split | Front end, queue and engine core come from vLLM's per-request stats; control requests (frames, same-length text) give the rest by subtraction |
 | Batching as pipelining | With one request filling 61% of the KV cache, throughput is set by the slower of the CPU stage and the GPU stage |
 | `set_default_torch_num_threads` | vLLM runs the HF processor with `OMP_NUM_THREADS` torch threads, or 1 when unset |
-| Threads vs processes | The 8 threads split each tensor op inside one video; the pipeline overlaps videos across processes |
-| Page-fault bound | A copy-heavy processor spends more time in the kernel faulting in fresh memory than in arithmetic |
-| `S + P / threads` | A two-point fit that shows ~7 s of the processor never parallelizes |
+| Threads vs requests | The 8 threads are inside one video's processing; requests in flight are across videos |
+| Page faults | On one thread the processor spent 17 s in system CPU against 9 s in user CPU, with 9.3M page faults |
+| `S + P / threads` | A two-point fit that is consistent with ~7 s of the processor that never shrinks; I did not isolate what it is |
 | torch.compile in vLLM | `enforce_eager=False` fuses RMSNorm and other elementwise ops: 6.07 → 1.27 s per prefill |
 | Prefix cache hash chain | Each block's hash includes the previous one, so only an identical start of the prompt can hit |
 | Video first | Putting the shared video before the pass-specific text makes the two passes share a 307k-token prefix |
-| Eviction | The cache holds ~1.5 videos; another recording's prefill between the passes breaks the chain |
+| Cache size | With prefix caching on, the KV cache holds 483,791 tokens (503,584 without) |
 | Same answer text | A strict but label-free check that catches numerics changes; the eval set is the real test |
